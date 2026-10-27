@@ -10,7 +10,11 @@ import numpy as np
 import pandas as pd
 
 import config
-from data.process import playtype_matchup_residual
+from data.process import (
+    home_road_matchup_residual,
+    playtype_matchup_residual,
+    quarter_matchup_residual,
+)
 from data.static_arenas import normalize_abbrev
 
 logger = logging.getLogger(__name__)
@@ -60,7 +64,25 @@ def margin_to_win_prob(margin: float, sigma: float | None = None) -> float:
 def _early_season_weight(games_n: int) -> float:
     """How much to trust current-season sample vs durable prior (0..1)."""
     k = float(max(config.PRIOR_BLEND_GAMES, 1))
+    early = float(max(config.EARLY_SEASON_GAMES, 1))
+    if games_n < early:
+        # Extra-conservative under EARLY_SEASON_GAMES
+        return float((games_n / early) ** 2 * (early / (early + k)))
     return float(games_n / (games_n + k))
+
+
+def _sanity_clamp_scores(home_pts: float, away_pts: float) -> tuple[float, float]:
+    """Clamp absurd totals / margins while preserving direction of the margin."""
+    margin = home_pts - away_pts
+    total = home_pts + away_pts
+    if abs(margin) > config.MARGIN_ABS_CAP:
+        margin = math.copysign(config.MARGIN_ABS_CAP, margin)
+    total = float(np.clip(total, config.TOTAL_MIN, config.TOTAL_MAX))
+    home_pts = (total + margin) / 2.0
+    away_pts = (total - margin) / 2.0
+    home_pts = float(np.clip(home_pts, 88.0, 140.0))
+    away_pts = float(np.clip(away_pts, 88.0, 140.0))
+    return home_pts, away_pts
 
 
 def _mean_scores(
@@ -85,10 +107,15 @@ def _mean_scores(
     w_a = _finite(ar.get("blend_weight_current"), w_cur)
     w_sample = min(w_h, w_a, w_cur)
 
-    # Pace: blend toward league default early; coach/style proxy = sustained pace
+    ctx = features.get("context") or {}
+    h_ctx = ctx.get(f"{game.get('game_id')}:{home}") or {}
+    a_ctx = ctx.get(f"{game.get('game_id')}:{away}") or {}
+
+    # Pace: blend toward league default early; rest/fatigue slows tired teams
     pace_raw = 0.5 * (float(hr["pace"]) + float(ar["pace"]))
     pace = (1.0 - w_sample) * config.DEFAULT_PACE + w_sample * pace_raw
-    pace = float(np.clip(0.5 * (pace_raw + pace), 92.0, 108.0))
+    pace += 0.5 * (_finite(h_ctx.get("pace_adj")) + _finite(a_ctx.get("pace_adj")))
+    pace = float(np.clip(0.5 * (pace_raw + pace), 90.0, 110.0))
 
     impact = features.get("team_impact") or {}
     hi = impact.get(home) or {}
@@ -133,9 +160,6 @@ def _mean_scores(
     home_pts += net_margin / 2.0
     away_pts -= net_margin / 2.0
 
-    ctx = features.get("context") or {}
-    h_ctx = ctx.get(f"{game.get('game_id')}:{home}") or {}
-    a_ctx = ctx.get(f"{game.get('game_id')}:{away}") or {}
     # Full context (home court, B2B, travel) — do not damp to 0.6
     home_pts += _finite(
         h_ctx.get("context_points"),
@@ -143,8 +167,60 @@ def _mean_scores(
     )
     away_pts += _finite(a_ctx.get("context_points"), 0.0)
 
+    # Hot/cold team form (shrunk further early season)
+    form = features.get("team_form") or {}
+    h_form = form.get(home) or {}
+    a_form = form.get(away) or {}
+    form_scale = 0.55 + 0.45 * w_sample
+    h_form_edge = form_scale * _finite(h_form.get("form_edge"))
+    a_form_edge = form_scale * _finite(a_form.get("form_edge"))
+    home_pts += 0.55 * h_form_edge
+    away_pts += 0.55 * a_form_edge
+
+    # Key player hot/cold (small nudge; notes carry the signal)
+    player_form = features.get("player_form") or {}
+    player_notes: list[str] = []
+    h_player_form = 0.0
+    a_player_form = 0.0
+    for pf in player_form.values():
+        if normalize_abbrev(pf.get("team")) == home:
+            delta = _finite(pf.get("delta"))
+            bump = float(np.clip(0.06 * delta, -0.8, 0.8))
+            h_player_form += bump
+            if pf.get("note"):
+                player_notes.append(str(pf["note"]))
+        elif normalize_abbrev(pf.get("team")) == away:
+            delta = _finite(pf.get("delta"))
+            bump = float(np.clip(0.06 * delta, -0.8, 0.8))
+            a_player_form += bump
+            if pf.get("note"):
+                player_notes.append(str(pf["note"]))
+    home_pts += h_player_form
+    away_pts += a_player_form
+
     matchup_edge, matchup_notes = playtype_matchup_residual(
         features.get("play_types"), home, away
+    )
+    hr_edge, hr_notes = home_road_matchup_residual(
+        features.get("home_road") or {}, home, away
+    )
+    matchup_edge += hr_edge
+    matchup_notes = list(matchup_notes) + list(hr_notes)
+
+    # Preliminary margin for clutch/Q4 decision (before quarter residual)
+    prelim_margin = home_pts - away_pts
+    clutch = abs(prelim_margin) < config.CLUTCH_MARGIN_THRESHOLD
+    q_edge, q_notes = quarter_matchup_residual(
+        features.get("quarter_profiles") or {},
+        home,
+        away,
+        clutch=clutch,
+    )
+    matchup_edge += q_edge
+    matchup_notes = list(matchup_notes) + list(q_notes)
+
+    matchup_edge = float(
+        np.clip(matchup_edge, -config.MATCHUP_RESIDUAL_CAP - 1.5, config.MATCHUP_RESIDUAL_CAP + 1.5)
     )
     home_pts += matchup_edge / 2.0
     away_pts -= matchup_edge / 2.0
@@ -158,9 +234,9 @@ def _mean_scores(
     home_pts = (total + margin) / 2.0
     away_pts = (total - margin) / 2.0
 
-    home_pts = float(np.clip(home_pts, 88.0, 140.0))
-    away_pts = float(np.clip(away_pts, 88.0, 140.0))
+    home_pts, away_pts = _sanity_clamp_scores(home_pts, away_pts)
 
+    form_notes = [n for n in (h_form.get("note"), a_form.get("note")) if n]
     meta = {
         "home": home,
         "away": away,
@@ -179,6 +255,12 @@ def _mean_scores(
         "games_n": games_n,
         "matchup_edge": matchup_edge,
         "matchup_notes": matchup_notes,
+        "quarter_notes": q_notes,
+        "form_notes": form_notes,
+        "player_form_notes": player_notes[:4],
+        "h_form": h_form,
+        "a_form": a_form,
+        "clutch": clutch,
         "h_ctx": h_ctx,
         "a_ctx": a_ctx,
     }
@@ -278,6 +360,12 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
         )
     )
 
+    form_tags = []
+    for side_form in (meta.get("a_form") or {}, meta.get("h_form") or {}):
+        tag = side_form.get("tag")
+        if tag in {"HOT", "COLD"}:
+            form_tags.append(f"{side_form.get('team')} {tag}")
+
     return {
         "game_id": game.get("game_id"),
         "game_date": game.get("game_date"),
@@ -294,6 +382,8 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
         "confidence": round(confidence, 3),
         "pace": round(meta["pace"], 1),
         "sim_count": sims["sim_count"],
+        "clutch_q4": bool(meta.get("clutch")),
+        "form_tags": form_tags,
         "sims": {
             "home_pts_p10": round(sims["home_pts_p10"], 1),
             "home_pts_p90": round(sims["home_pts_p90"], 1),
@@ -307,6 +397,9 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
             "injuries": injury_notes[:6],
             "rest_travel": flags,
             "play_types": meta["matchup_notes"],
+            "form": list(meta.get("form_notes") or [])
+            + list(meta.get("player_form_notes") or [])[:4],
+            "quarters": list(meta.get("quarter_notes") or [])[:3],
         },
         "components": {
             "home_off": round(meta["h_off"], 2),
@@ -319,6 +412,8 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
             "sample_weight": round(meta["w_sample"], 3),
             "home_net": round(meta["h_off"] - meta["h_def"], 2),
             "away_net": round(meta["a_off"] - meta["a_def"], 2),
+            "home_form_edge": round(_finite((meta.get("h_form") or {}).get("form_edge")), 2),
+            "away_form_edge": round(_finite((meta.get("a_form") or {}).get("form_edge")), 2),
         },
     }
 

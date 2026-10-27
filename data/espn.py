@@ -370,6 +370,165 @@ def _roster_name_to_team() -> dict[str, str]:
     return mapping
 
 
+def _period_points(linescores: list[dict[str, Any]] | None) -> dict[int, float]:
+    """Map period number -> points from ESPN linescores."""
+    out: dict[int, float] = {}
+    if not linescores:
+        return out
+    for i, ls in enumerate(linescores, start=1):
+        period = int(ls.get("period") or i)
+        if period > 4:
+            continue  # ignore OT for tendency baselines
+        val = ls.get("value")
+        if val is None:
+            try:
+                val = float(ls.get("displayValue"))
+            except (TypeError, ValueError):
+                continue
+        try:
+            out[period] = float(val)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def recent_quarter_game_rows(days_back: int = 21) -> list[dict[str, Any]]:
+    """
+    Pull completed scoreboards for the last N days and emit per-team quarter
+    scoring rows (Q1-Q4). Free ESPN scoreboard already includes linescores.
+    """
+    from datetime import date, timedelta
+
+    today = date.today()
+    rows: list[dict[str, Any]] = []
+    seen_games: set[str] = set()
+    for delta in range(1, max(1, days_back) + 1):
+        d = today - timedelta(days=delta)
+        try:
+            data = _get(f"{SITE}/scoreboard", params={"dates": d.strftime("%Y%m%d")})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ESPN scoreboard %s failed: %s", d, exc)
+            continue
+        for ev in data.get("events") or []:
+            gid = str(ev.get("id") or "")
+            if not gid or gid in seen_games:
+                continue
+            comp = (ev.get("competitions") or [None])[0]
+            if not comp:
+                continue
+            status = ((comp.get("status") or {}).get("type") or {}).get("name") or ""
+            if status != "STATUS_FINAL":
+                continue
+            seen_games.add(gid)
+            comps = comp.get("competitors") or []
+            parsed: list[tuple[str, bool, dict[int, float], float | None]] = []
+            for c in comps:
+                abbr = normalize_abbrev((c.get("team") or {}).get("abbreviation"))
+                if not abbr:
+                    continue
+                qpts = _period_points(c.get("linescores"))
+                if len(qpts) < 4:
+                    continue
+                sc = _score_val(c)
+                parsed.append((abbr, c.get("homeAway") == "home", qpts, sc))
+            if len(parsed) != 2:
+                continue
+            for abbr, is_home, qpts, sc in parsed:
+                opp = next(p[0] for p in parsed if p[0] != abbr)
+                opp_q = next(p[2] for p in parsed if p[0] != abbr)
+                rows.append(
+                    {
+                        "game_id": gid,
+                        "game_date": d.isoformat(),
+                        "TEAM_ABBREVIATION": abbr,
+                        "OPP_ABBREVIATION": opp,
+                        "IS_HOME": is_home,
+                        "PTS": sc,
+                        "Q1": qpts.get(1),
+                        "Q2": qpts.get(2),
+                        "Q3": qpts.get(3),
+                        "Q4": qpts.get(4),
+                        "OPP_Q1": opp_q.get(1),
+                        "OPP_Q2": opp_q.get(2),
+                        "OPP_Q3": opp_q.get(3),
+                        "OPP_Q4": opp_q.get(4),
+                        "SOURCE": "espn_scoreboard_quarters",
+                    }
+                )
+    return rows
+
+
+def player_gamelog_recent(
+    athlete_id: str,
+    *,
+    season_end_year: int | None = None,
+    last_n: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    Recent per-game counting stats for one ESPN athlete id.
+    season_end_year: ending calendar year of the NBA season (2026-27 -> 2027).
+    """
+    if not athlete_id:
+        return []
+    year = season_end_year
+    if year is None:
+        year = config.current_season_year() + 1
+    try:
+        data = _get(
+            f"{WEB}/athletes/{athlete_id}/gamelog",
+            params={"season": int(year)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ESPN gamelog %s failed: %s", athlete_id, exc)
+        return []
+
+    names = list(data.get("names") or [])
+    try:
+        pts_i = names.index("points")
+    except ValueError:
+        pts_i = len(names) - 1 if names else -1
+    try:
+        min_i = names.index("minutes")
+    except ValueError:
+        min_i = 0 if names else -1
+
+    events_meta = data.get("events") or {}
+    dated: list[tuple[str, dict[str, Any]]] = []
+    for st in data.get("seasonTypes") or []:
+        for cat in st.get("categories") or []:
+            for ev in cat.get("events") or []:
+                eid = str(ev.get("eventId") or "")
+                stats = ev.get("stats") or []
+                meta = events_meta.get(eid) or {}
+                gdate = str(meta.get("gameDate") or "")[:10]
+                if not gdate or pts_i < 0 or pts_i >= len(stats):
+                    continue
+                try:
+                    pts = float(stats[pts_i])
+                except (TypeError, ValueError):
+                    continue
+                mins = None
+                if 0 <= min_i < len(stats):
+                    try:
+                        mins = float(stats[min_i])
+                    except (TypeError, ValueError):
+                        mins = None
+                dated.append(
+                    (
+                        gdate,
+                        {
+                            "game_date": gdate,
+                            "pts": pts,
+                            "minutes": mins,
+                            "event_id": eid,
+                            "result": meta.get("gameResult"),
+                        },
+                    )
+                )
+    dated.sort(key=lambda x: x[0], reverse=True)
+    return [row for _, row in dated[: max(1, last_n)]]
+
+
 def enrich_ratings_from_season_stats(season_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert ESPN season averages into process.build_team_rolling-compatible summary rows."""
     out = []
