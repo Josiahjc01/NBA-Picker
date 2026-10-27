@@ -1,0 +1,80 @@
+name: Build Windows NBA-Picker.exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "gui.py"
+      - "main.py"
+      - "config.py"
+      - "data/**"
+      - "model/**"
+      - "nba_picker.spec"
+      - "build_windows.bat"
+      - "requirements.txt"
+      - "requirements-build.txt"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build windowed NBA-Picker.exe
+        run: python -m PyInstaller --noconfirm nba_picker.spec
+
+      - name: Verify PE executable
+        shell: pwsh
+        run: |
+          $exe = "dist\NBA-Picker.exe"
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "Not a Windows PE executable (missing MZ header)"
+          }
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NBA-Picker-windows
+          path: dist/NBA-Picker.exe
+          if-no-files-found: error
+
+      - name: Zip for release
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\NBA-Picker.exe -DestinationPath NBA-Picker-windows.zip -Force
+
+      - name: Publish / update GitHub Release windows-exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-exe
+          name: Windows NBA-Picker.exe
+          body: |
+            Prebuilt windowed `NBA-Picker.exe` (PyInstaller, `windows-latest`).
+
+            Download `NBA-Picker-windows.zip`, extract, and run `NBA-Picker.exe` on Windows.
+            First launch may need network access for free data sources. Optional odds API keys
+            can be set in a `.env` beside the exe (see `.env.example` in the repo).
+          files: NBA-Picker-windows.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
