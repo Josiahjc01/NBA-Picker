@@ -381,15 +381,38 @@ def fetch_play_types(season: str | None = None, force: bool = False) -> pd.DataF
 
 
 # ---------------------------------------------------------------------------
-# Injuries — official NBA PDF/HTML or ESPN fallback
+# Rosters — ESPN current team membership (source of truth for who is on each team)
 # ---------------------------------------------------------------------------
 
-def _parse_espn_injuries() -> list[dict[str, Any]]:
+def fetch_rosters(force: bool = False) -> list[dict[str, Any]]:
+    """Current NBA rosters (ESPN). Prefer over stale team tags on season stats."""
+    key = "rosters_current"
+
+    def _fetch():
+        from data import espn
+
+        rows = espn.team_rosters()
+        if not rows:
+            raise RuntimeError("Empty ESPN roster response")
+        logger.info("Fetched ESPN rosters (%d players, %d teams)", len(rows), len({r["TEAM_ABBREVIATION"] for r in rows}))
+        return rows
+
+    try:
+        return load_or_fetch_json(key, _fetch, force=force) or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Roster fetch failed: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Injuries — ESPN API first; HTML scrape fallback (skip junk official landing pages)
+# ---------------------------------------------------------------------------
+
+def _parse_espn_injuries_html() -> list[dict[str, Any]]:
     url = "https://www.espn.com/nba/injuries"
     resp = _get(url)
     soup = BeautifulSoup(resp.text, "html.parser")
     injuries: list[dict[str, Any]] = []
-    # ESPN ResponsiveTable: NAME, POS, EST. RETURN, STATUS, COMMENT
     tables = soup.select("div.ResponsiveTable")
     for table in tables:
         team_el = table.select_one(".Table__Title, div.Table__Title")
@@ -399,64 +422,66 @@ def _parse_espn_injuries() -> list[dict[str, Any]]:
             if len(cells) < 4:
                 continue
             player = cells[0]
-            # Prefer explicit STATUS column (index 3); fall back to last short token
             status = cells[3] if len(cells) >= 4 else cells[-1]
             comment = cells[4] if len(cells) >= 5 else ""
+            if not player or len(player) < 3:
+                continue
+            # Skip non-player boilerplate rows
+            if "report" in player.lower() and "update" in player.lower():
+                continue
             injuries.append(
                 {
                     "team": team_name,
+                    "team_abbr": "",
                     "player": player,
                     "status": status,
                     "comment": comment,
-                    "source": "espn",
+                    "source": "espn_html",
                 }
             )
     return injuries
 
 
-def _parse_official_injury_report() -> list[dict[str, Any]]:
-    """Try official.nba.com injury report landing / CDN listing."""
-    # Official reports are often PDFs named by date; HTML index varies.
-    candidates = [
-        "https://official.nba.com/nba-injury-report/",
-        "https://ak-static.cms.nba.com/referee/injury/",
-    ]
-    injuries: list[dict[str, Any]] = []
-    for url in candidates:
-        try:
-            resp = _get(url)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            text = soup.get_text("\n", strip=True)
-            # Soft parse: look for Out/Doubtful/Questionable lines
-            for line in text.splitlines():
-                low = line.lower()
-                if any(k in low for k in ("out", "doubtful", "questionable", "available")):
-                    if len(line) < 8 or len(line) > 200:
-                        continue
-                    injuries.append(
-                        {
-                            "team": "",
-                            "player": line.split("-")[0].strip()[:80],
-                            "status": line,
-                            "comment": "",
-                            "source": "official.nba.com",
-                        }
-                    )
-            if injuries:
-                return injuries[:500]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Official injury scrape %s failed: %s", url, exc)
-    return injuries
+def _looks_like_player_injury(row: dict[str, Any]) -> bool:
+    """Filter out official.nba.com landing-page junk that used to poison the cache."""
+    player = str(row.get("player") or "").strip()
+    status = str(row.get("status") or "").strip()
+    if len(player) < 3 or not re.search(r"[A-Za-z]", player):
+        return False
+    low = player.lower()
+    if any(x in low for x in ("reports are updated", "injury report", "continual basis", "click here")):
+        return False
+    if not re.search(r"\b(out|doubtful|questionable|probable|available|gtd|day-to-day|dtd)\b", status, re.I):
+        # Allow if status column is short token like "Out"
+        if status.lower() not in {"out", "doubtful", "questionable", "probable", "available"}:
+            return False
+    return True
 
 
 def fetch_injuries(force: bool = False) -> list[dict[str, Any]]:
-    key = "injuries"
+    key = "injuries_v2"
 
     def _fetch():
-        official = _parse_official_injury_report()
-        if official:
-            return official
-        return _parse_espn_injuries()
+        from data import espn
+
+        errors: list[str] = []
+        try:
+            rows = espn.injuries_api()
+            rows = [r for r in rows if _looks_like_player_injury(r)]
+            if rows:
+                logger.info("Injuries from ESPN API (%d)", len(rows))
+                return rows
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"espn_api: {exc}")
+        try:
+            rows = _parse_espn_injuries_html()
+            rows = [r for r in rows if _looks_like_player_injury(r)]
+            if rows:
+                logger.info("Injuries from ESPN HTML (%d)", len(rows))
+                return rows
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"espn_html: {exc}")
+        raise RuntimeError("; ".join(errors) or "No injury source available")
 
     try:
         return load_or_fetch_json(key, _fetch, force=force) or []
@@ -704,6 +729,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     prior_logs = fetch_prior_season_logs(force=force)
     team_adv = fetch_team_advanced(force=force)
     four_factors = fetch_team_four_factors(force=force)
+    rosters = fetch_rosters(force=force)
     players = fetch_player_stats(force=force)
     play_types = fetch_play_types(force=force)
     injuries = fetch_injuries(force=force)
@@ -714,8 +740,10 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "target_date": target_date.isoformat(),
         "games": games,
         "team_logs_rows": len(team_logs),
+        "roster_count": len(rosters),
         "injuries_count": len(injuries),
         "impact_count": len(impact),
+        "player_stats_rows": int(len(players)) if players is not None else 0,
     }
     write_json_cache(config.CACHE_DIR / f"bundle_meta_{target_date.isoformat()}.json", bundle)
 
@@ -725,6 +753,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "prior_logs": prior_logs,
         "team_adv": team_adv,
         "four_factors": four_factors,
+        "rosters": rosters,
         "players": players,
         "play_types": play_types,
         "injuries": injuries,

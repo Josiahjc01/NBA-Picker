@@ -53,27 +53,151 @@ def minutes_factor_from_status(status: str) -> float:
     return 1.0
 
 
+def _norm_name(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+
+
 def index_injuries(injuries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """player-name-lower → injury record with minutes factor."""
+    """player-name-lower → injury record with minutes factor + team abbr when known."""
     out: dict[str, dict[str, Any]] = {}
     for inj in injuries or []:
         name = str(inj.get("player") or "").strip()
         if not name:
             continue
-        status = str(inj.get("status") or inj.get("comment") or "")
-        key = re.sub(r"\s+", " ", name).lower()
-        # Keep most severe if duplicates
+        status = str(inj.get("status") or "")
+        # Prefer dedicated status; only fall back to comment if status empty
+        if not status.strip():
+            status = str(inj.get("comment") or "")
+        key = _norm_name(name)
         factor = minutes_factor_from_status(status)
+        team_abbr = normalize_abbrev(str(inj.get("team_abbr") or ""))
         prev = out.get(key)
         if prev is None or factor < prev["minutes_factor"]:
             out[key] = {
                 "player": name,
                 "team": inj.get("team"),
+                "team_abbr": team_abbr,
                 "status": status,
                 "minutes_factor": factor,
                 "source": inj.get("source"),
             }
     return out
+
+
+def align_players_to_rosters(
+    players: pd.DataFrame | None,
+    rosters: list[dict[str, Any]] | None,
+) -> pd.DataFrame:
+    """
+    Remap season stats onto current roster membership.
+
+    - Players on a roster keep/get that team's abbreviation (fixes post-trade tags).
+    - Roster players missing from the stats feed are added with empty counting stats
+      so injury / depth charts still see them.
+    - Stats rows for players not on any current roster are dropped (stale).
+    """
+    roster_rows = rosters or []
+    if not roster_rows:
+        return players.copy() if players is not None else pd.DataFrame()
+
+    roster_by_name: dict[str, dict[str, Any]] = {}
+    for r in roster_rows:
+        key = _norm_name(r.get("PLAYER_NAME") or "")
+        if not key:
+            continue
+        # Prefer active over inactive if duplicates
+        prev = roster_by_name.get(key)
+        status = str(r.get("STATUS") or "active").lower()
+        if prev is None or (status == "active" and str(prev.get("STATUS") or "").lower() != "active"):
+            roster_by_name[key] = r
+
+    if players is None or (isinstance(players, pd.DataFrame) and players.empty):
+        # Roster-only skeleton
+        return pd.DataFrame(
+            [
+                {
+                    "PLAYER_NAME": r["PLAYER_NAME"],
+                    "TEAM_ABBREVIATION": normalize_abbrev(r["TEAM_ABBREVIATION"]),
+                    "MIN": 0.0,
+                    "PTS": None,
+                    "REB": None,
+                    "AST": None,
+                    "STL": None,
+                    "BLK": None,
+                    "GP": None,
+                    "ON_ROSTER": True,
+                    "ROSTER_STATUS": r.get("STATUS"),
+                    "SOURCE": "roster_only",
+                }
+                for r in roster_by_name.values()
+            ]
+        )
+
+    df = players.copy()
+    name_c = next((c for c in ("PLAYER_NAME", "player", "PLAYER") if c in df.columns), None)
+    team_c = next((c for c in ("TEAM_ABBREVIATION", "team") if c in df.columns), None)
+    if not name_c:
+        return df
+
+    aligned: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, row in df.iterrows():
+        name = str(row.get(name_c) or "")
+        key = _norm_name(name)
+        rost = roster_by_name.get(key)
+        if rost is None:
+            # Soft last-name+first-initial match against roster
+            parts = [p for p in key.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+            if len(parts) >= 2:
+                last, first = parts[-1], parts[0]
+                for rk, rv in roster_by_name.items():
+                    rp = [p for p in rk.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+                    if len(rp) >= 2 and rp[-1] == last and rp[0][:1] == first[:1]:
+                        rost = rv
+                        key = rk
+                        break
+        if rost is None:
+            continue  # not on a current roster
+        if key in seen:
+            continue
+        seen.add(key)
+        d = row.to_dict()
+        d["PLAYER_NAME"] = rost.get("PLAYER_NAME") or name
+        d["TEAM_ABBREVIATION"] = normalize_abbrev(rost["TEAM_ABBREVIATION"])
+        d["ON_ROSTER"] = True
+        d["ROSTER_STATUS"] = rost.get("STATUS")
+        aligned.append(d)
+
+    # Add roster players with no season-stats row yet
+    for key, rost in roster_by_name.items():
+        if key in seen:
+            continue
+        aligned.append(
+            {
+                "PLAYER_NAME": rost["PLAYER_NAME"],
+                "TEAM_ABBREVIATION": normalize_abbrev(rost["TEAM_ABBREVIATION"]),
+                "MIN": 0.0,
+                "PTS": None,
+                "REB": None,
+                "AST": None,
+                "STL": None,
+                "BLK": None,
+                "GP": None,
+                "ON_ROSTER": True,
+                "ROSTER_STATUS": rost.get("STATUS"),
+                "SOURCE": "roster_only",
+            }
+        )
+
+    out = pd.DataFrame(aligned)
+    logger.info(
+        "Aligned players to rosters: %d stats→roster matches, %d roster-only, %d total",
+        len(seen),
+        len(out) - len(seen),
+        len(out),
+    )
+    return out
+
 
 
 def build_team_rolling(team_logs: pd.DataFrame, span: int | None = None) -> pd.DataFrame:
@@ -223,11 +347,47 @@ def blend_with_prior(
     return pd.DataFrame(out)
 
 
+def _match_injury(
+    name: str,
+    team: str,
+    injuries: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Exact then soft last-name match; prefer same-team when team_abbr known."""
+    key = _norm_name(name)
+    if key in injuries:
+        return injuries[key]
+    parts = [p for p in key.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+    last = parts[-1] if parts else ""
+    if len(last) < 4:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for ik, iv in injuries.items():
+        ik_parts = [p for p in ik.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+        if ik_parts and ik_parts[-1] == last:
+            candidates.append(iv)
+    if not candidates:
+        return None
+    team_u = normalize_abbrev(team)
+    if team_u:
+        same = [
+            c
+            for c in candidates
+            if normalize_abbrev(str(c.get("team_abbr") or "")) == team_u
+            or team_u.lower() in str(c.get("team") or "").lower()
+        ]
+        if same:
+            # Most severe
+            return min(same, key=lambda c: c.get("minutes_factor", 1.0))
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def project_player_minutes(
     players: pd.DataFrame,
     injuries: dict[str, dict[str, Any]],
 ) -> pd.DataFrame:
-    """Recent minutes × injury factor."""
+    """Season / recent minutes × injury factor (injuries win)."""
     if players is None or players.empty:
         return pd.DataFrame(columns=["player", "team", "proj_minutes", "impact", "adj_minutes"])
 
@@ -243,30 +403,9 @@ def project_player_minutes(
         name = str(r.get(name_c))
         team = normalize_abbrev(str(r.get(team_c, ""))) if team_c else ""
         mins = float(pd.to_numeric(r.get(min_c), errors="coerce") or 0.0) if min_c else 0.0
-        key = re.sub(r"\s+", " ", name).lower()
-        inj = injuries.get(key)
+        # Inactive / G-League two-ways with no minutes stay at 0
+        inj = _match_injury(name, team, injuries)
         factor = inj["minutes_factor"] if inj else 1.0
-        # Soft name match: significant last token only (skip Jr/Sr/II/III)
-        if inj is None:
-            parts = [p for p in key.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
-            last = parts[-1] if parts else ""
-            if len(last) >= 4:
-                for ik, iv in injuries.items():
-                    ik_parts = [
-                        p
-                        for p in ik.replace(".", "").split()
-                        if p not in {"jr", "sr", "ii", "iii", "iv"}
-                    ]
-                    if ik_parts and ik_parts[-1] == last:
-                        # Require team agreement when both known
-                        inj_team = str(iv.get("team") or "").lower()
-                        if inj_team and team and team.lower() not in inj_team and inj_team not in team.lower():
-                            # team name vs abbr — allow if either empty mismatch only
-                            if len(inj_team) > 3 and team.lower() not in inj_team:
-                                continue
-                        factor = iv["minutes_factor"]
-                        inj = iv
-                        break
         rows.append(
             {
                 "player": name,
@@ -275,6 +414,7 @@ def project_player_minutes(
                 "minutes_factor": factor,
                 "adj_minutes": mins * factor,
                 "injury_status": (inj or {}).get("status"),
+                "injury_source": (inj or {}).get("source"),
             }
         )
     return pd.DataFrame(rows)
@@ -505,8 +645,9 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         else:
             ratings = blend_with_prior(ratings, espn_seed, n_blend=max(config.PRIOR_BLEND_GAMES, 1))
 
+    players = align_players_to_rosters(raw.get("players"), raw.get("rosters") or [])
     inj_idx = index_injuries(raw.get("injuries") or [])
-    minutes = project_player_minutes(raw.get("players"), inj_idx)
+    minutes = project_player_minutes(players, inj_idx)
     impact = team_impact_from_players(minutes, raw.get("impact") or [])
     context = rest_and_travel_context(raw.get("games") or [], raw.get("team_logs"), target)
 
@@ -519,6 +660,77 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         "play_types": raw.get("play_types"),
         "games": raw.get("games") or [],
         "team_logs": raw.get("team_logs"),
-        "players": raw.get("players"),
+        "players": players,
+        "rosters": raw.get("rosters") or [],
         "target_date": target.isoformat(),
     }
+
+
+def verify_matchup_personnel(
+    features: dict[str, Any],
+    away: str,
+    home: str,
+) -> dict[str, Any]:
+    """
+    Short verification snapshot for a matchup: roster sizes, key players,
+    injury flags, and projected minutes — logged/printed to spot bad data.
+    """
+    away = normalize_abbrev(away)
+    home = normalize_abbrev(home)
+    minutes = features.get("minutes")
+    if minutes is None or (isinstance(minutes, pd.DataFrame) and minutes.empty):
+        return {"away": away, "home": home, "error": "no minutes frame"}
+
+    def _side(abbr: str) -> dict[str, Any]:
+        g = minutes[minutes["team"] == abbr].copy()
+        g = g.sort_values("proj_minutes", ascending=False)
+        top = g.head(8)
+        injured = g[g["minutes_factor"] < 0.95].sort_values("proj_minutes", ascending=False)
+        return {
+            "team": abbr,
+            "roster_size": int(len(g)),
+            "key_players": [
+                {
+                    "player": str(r["player"]),
+                    "proj_min": round(float(r["proj_minutes"] or 0), 1),
+                    "adj_min": round(float(r["adj_minutes"] or 0), 1),
+                    "injury": r.get("injury_status") or "",
+                }
+                for _, r in top.iterrows()
+            ],
+            "injury_flags": [
+                {
+                    "player": str(r["player"]),
+                    "status": r.get("injury_status") or "",
+                    "factor": float(r["minutes_factor"]),
+                    "proj_min": round(float(r["proj_minutes"] or 0), 1),
+                    "adj_min": round(float(r["adj_minutes"] or 0), 1),
+                }
+                for _, r in injured.head(8).iterrows()
+            ],
+        }
+
+    report = {"away": _side(away), "home": _side(home)}
+    for side in ("away", "home"):
+        s = report[side]
+        logger.info(
+            "VERIFY %s roster=%d | top: %s",
+            s["team"],
+            s["roster_size"],
+            ", ".join(
+                f"{p['player']} {p['proj_min']}→{p['adj_min']}m"
+                + (f" [{p['injury']}]" if p["injury"] else "")
+                for p in s["key_players"][:5]
+            ),
+        )
+        if s["injury_flags"]:
+            logger.info(
+                "VERIFY %s injuries: %s",
+                s["team"],
+                "; ".join(
+                    f"{p['player']}={p['status']} ({p['proj_min']}→{p['adj_min']})"
+                    for p in s["injury_flags"][:5]
+                ),
+            )
+    return report
+

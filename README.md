@@ -70,6 +70,13 @@ config.py              knobs + paths
 
 Win probability uses a logistic of expected margin (σ ≈ 12.5).
 
+### Rosters / injuries / minutes
+
+- **Rosters:** ESPN team roster endpoints are the membership source of truth (trades, two-ways).
+- **Stats:** Season per-game lines (nba_api when reachable, else ESPN) are **remapped** onto current rosters; stale off-roster rows are dropped; roster-only players are kept for depth/injury.
+- **Injuries:** ESPN injuries API (HTML scrape fallback). Status → minutes factor (Out=0, Doubtful≈0.15, Questionable≈0.55, Probable≈0.9). Junk official.nba.com landing text is ignored.
+- **Verification:** `python main.py --away BOS --home NYK --date YYYY-MM-DD` prints roster size, key minutes, and injury flags for that matchup.
+
 ## Graceful degradation
 
 | Source fails | Behavior |
@@ -78,7 +85,7 @@ Win probability uses a logistic of expected margin (σ ≈ 12.5).
 | Scoreboard | Empty slate message — try another `--date` |
 | Advanced / Synergy | Game-log / ESPN season proxies |
 | EPM scrapes | dunksandthrees → nbarapm → darko → PTS z-score proxy |
-| Injuries | ESPN table (official.nba.com tried first) |
+| Injuries | ESPN API → ESPN HTML; empty if both fail |
 
 Set `SKIP_NBA_API=1` to force ESPN-only mode (faster on blocked networks).
 
