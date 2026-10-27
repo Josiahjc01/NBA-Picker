@@ -487,6 +487,10 @@ def team_impact_from_players(
                 mins = 0.0
             if not np.isfinite(base_mins):
                 base_mins = 0.0
+            # Rotation players are above replacement even when EPM scrapes are noisy
+            # or negative early-season z-scores — otherwise Out looks like a "help".
+            if base_mins >= config.ROTATION_MIN_MINUTES:
+                epm = max(epm, config.ROTATION_OUT_EPM_FLOOR)
             total += epm * (mins / 48.0)
             healthy += epm * (base_mins / 48.0)
             if r["minutes_factor"] < 0.95 and base_mins >= 15:

@@ -223,14 +223,22 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
         lines.append("")
         lines.append("Model projection")
         lines.append(
-            f"- Score: {away} {pred.get('away_pts')} – {home} {pred.get('home_pts')} "
+            f"- Mean score ({pred.get('sim_count') or 'sim'} runs): "
+            f"{away} {pred.get('away_pts')} - {home} {pred.get('home_pts')} "
             f"(total {pred.get('total')}, margin {pred.get('margin'):+.1f} home)"
         )
         lines.append(
-            f"- Win probability: {home} {float(pred.get('home_win_prob') or 0):.1%} · "
+            f"- Win probability (sims): {home} {float(pred.get('home_win_prob') or 0):.1%} / "
             f"{away} {float(pred.get('away_win_prob') or 0):.1%} "
             f"(confidence {pred.get('confidence')})"
         )
+        sims = pred.get("sims") or {}
+        if sims:
+            lines.append(
+                f"- Score band p10-p90: {away} {sims.get('away_pts_p10')}-{sims.get('away_pts_p90')} / "
+                f"{home} {sims.get('home_pts_p10')}-{sims.get('home_pts_p90')} "
+                f"(total {sims.get('total_p10')}-{sims.get('total_p90')})"
+            )
         notes = pred.get("notes") or {}
         if notes.get("injuries"):
             lines.append("- Injuries: " + "; ".join(notes["injuries"]))
