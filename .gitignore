@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Local secrets / IDE
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Cache contents (keep directory)
+cache/*
+!cache/.gitkeep
+
+# Output artifacts (keep directory)
+output/*
+!output/.gitkeep
+
+# Test / temp
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyInstaller (Windows build artifacts)
+build/
+dist/
+*.spec.bak
