@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NBA Picker — free on-demand game predictor and wager recommender."""
+"""NBA Picker — free on-demand game predictor (local personal use)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import config
 from data.fetch import fetch_all
 from data.process import build_features
 from model.predict import predict_slate
-from model.wagers import rank_top_wagers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +50,6 @@ def resolve_date(raw: str | None) -> date:
 def format_markdown(
     target: date,
     predictions: list[dict],
-    wagers: list[dict],
     meta: dict,
 ) -> str:
     lines = [
@@ -60,7 +58,7 @@ def format_markdown(
         f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
         "",
         f"Games: **{len(predictions)}** · Injuries cached: {meta.get('injuries_count', '?')} · "
-        f"Impact rows: {meta.get('impact_count', '?')} · Odds events: {meta.get('odds_events', 0)}",
+        f"Impact rows: {meta.get('impact_count', '?')}",
         "",
     ]
     if not predictions:
@@ -99,36 +97,10 @@ def format_markdown(
             lines.append("- **Play-type edges:** " + "; ".join(notes["play_types"]))
         lines.append("")
 
-    lines.append("## Top 5 +EV wagers")
-    lines.append("")
-    if not wagers:
-        lines.append(
-            "_No qualifying wagers (need odds API key, edge ≥ "
-            f"{config.MIN_EDGE_PCT:g}%, and sufficient confidence). "
-            "Pure model projections above still apply._"
-        )
-        lines.append("")
-    else:
-        lines.append(
-            "| Rank | Game | Side | Book | Odds | Model P | Edge | Stake (¼ Kelly) |"
-        )
-        lines.append("| ---: | --- | --- | --- | ---: | ---: | ---: | ---: |")
-        for i, w in enumerate(wagers, 1):
-            lines.append(
-                f"| {i} | {w['game']} | {w['side']} | {w['book']} | {w['odds']:+d} | "
-                f"{w['model_prob']:.1%} | {w['edge_pct']:.1f}% | {w['suggested_stake']:.2f} u |"
-            )
-        lines.append("")
-        lines.append(
-            f"_Stake units assume bankroll={config.BANKROLL_UNITS:g}; "
-            f"capped at {config.MAX_STAKE_PCT:g}u. Not financial advice._"
-        )
-        lines.append("")
-
     return "\n".join(lines)
 
 
-def print_terminal(target: date, predictions: list[dict], wagers: list[dict]) -> None:
+def print_terminal(target: date, predictions: list[dict]) -> None:
     print()
     print("=" * 64)
     print(f" NBA PICKER  ·  {target.isoformat()}")
@@ -156,18 +128,6 @@ def print_terminal(target: date, predictions: list[dict], wagers: list[dict]) ->
                 joined = ", ".join(vals) if isinstance(vals[0], str) else str(vals)
                 print(f"      [{label}] {joined}")
 
-    print()
-    print("-" * 64)
-    print(" TOP +EV WAGERS")
-    print("-" * 64)
-    if not wagers:
-        print("  (none — set ODDS_API_KEY or THERUNDOWN_API_KEY for book lines)")
-    else:
-        for i, w in enumerate(wagers, 1):
-            print(
-                f"  {i}. {w['game']:12}  {w['side']:22}  {w['book']:12}  "
-                f"{w['odds']:+5d}  edge {w['edge_pct']:5.1f}%  stake {w['suggested_stake']:.2f}u"
-            )
     print()
 
 
@@ -198,7 +158,7 @@ def run_pipeline(
     """
     Core pipeline used by CLI and GUI.
 
-    Returns payload dict with keys: date, generated_at, meta, predictions, wagers,
+    Returns payload dict with keys: date, generated_at, meta, predictions,
     markdown, md_path, json_path.
     """
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -217,16 +177,14 @@ def run_pipeline(
             or p.get("away_abbr", "").upper() in wanted
         ]
 
-    wagers = rank_top_wagers(predictions, features.get("odds") or [])
     meta = raw.get("meta") or {}
     payload = {
         "date": target.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "meta": meta,
         "predictions": predictions,
-        "wagers": wagers,
     }
-    md = format_markdown(target, predictions, wagers, meta)
+    md = format_markdown(target, predictions, meta)
     payload["markdown"] = md
     md_path = json_path = None
     if write_outputs:
@@ -239,8 +197,7 @@ def run_pipeline(
 def run(target: date, force: bool = False) -> int:
     payload = run_pipeline(target, force=force)
     predictions = payload["predictions"]
-    wagers = payload["wagers"]
-    print_terminal(target, predictions, wagers)
+    print_terminal(target, predictions)
     if payload.get("md_path"):
         print(f"Wrote {payload['md_path']}")
     if payload.get("json_path"):

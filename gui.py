@@ -257,17 +257,15 @@ class NbaPickerApp(tk.Tk):
                 md = payload.get("markdown") or format_markdown(
                     target,
                     payload.get("predictions") or [],
-                    payload.get("wagers") or [],
                     payload.get("meta") or {},
                 )
                 self._last_md = md
                 self._last_md_path = payload.get("md_path")
                 self._write_results(self._plain_from_payload(payload))
                 n = len(payload.get("predictions") or [])
-                w = len(payload.get("wagers") or [])
                 path = payload.get("md_path") or ""
                 self.status_var.set(
-                    f"Done — {n} game(s), {w} wager(s)."
+                    f"Done — {n} game(s)."
                     + (f" Saved {path}" if path else "")
                 )
 
@@ -301,20 +299,6 @@ class NbaPickerApp(tk.Tk):
                 lines.append("  Rest/travel: " + ", ".join(notes["rest_travel"]))
             if notes.get("play_types"):
                 lines.append("  Play-types: " + "; ".join(notes["play_types"]))
-        lines.append("")
-        lines.append("-" * 60)
-        lines.append("TOP +EV WAGERS")
-        lines.append("-" * 60)
-        wagers = payload.get("wagers") or []
-        if not wagers:
-            lines.append("(none — set ODDS_API_KEY or THERUNDOWN_API_KEY for book lines)")
-        else:
-            for i, w in enumerate(wagers, 1):
-                lines.append(
-                    f"{i}. {w['game']}  {w['side']}  {w['book']}  "
-                    f"{w['odds']:+d}  edge {w['edge_pct']:.1f}%  "
-                    f"stake {w['suggested_stake']:.2f}u"
-                )
         lines.append("")
         return "\n".join(lines)
 
