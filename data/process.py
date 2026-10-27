@@ -347,40 +347,59 @@ def blend_with_prior(
     return pd.DataFrame(out)
 
 
+def _injury_team_matches(inj: dict[str, Any], team: str) -> bool:
+    """True when injury row is for this team abbr (or team name contains abbr/city)."""
+    team_u = normalize_abbrev(team)
+    if not team_u:
+        return False
+    inj_abbr = normalize_abbrev(str(inj.get("team_abbr") or ""))
+    if inj_abbr and inj_abbr == team_u:
+        return True
+    inj_team = str(inj.get("team") or "").lower()
+    if not inj_team:
+        return False
+    # "Boston Celtics" vs BOS — require abbr already set when possible; else name token
+    if inj_abbr:
+        return False  # different team_abbr already known
+    return team_u.lower() in inj_team
+
+
 def _match_injury(
     name: str,
     team: str,
     injuries: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Exact then soft last-name match; prefer same-team when team_abbr known."""
+    """
+    Exact name match first; soft last-name match only when the injury is on the
+    same team (never apply another team's Coby White Out to Derrick White).
+    """
     key = _norm_name(name)
     if key in injuries:
-        return injuries[key]
+        hit = injuries[key]
+        # Exact full-name hit is trusted even if team_abbr missing
+        return hit
     parts = [p for p in key.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
     last = parts[-1] if parts else ""
+    first = parts[0] if parts else ""
     if len(last) < 4:
         return None
-    candidates: list[dict[str, Any]] = []
-    for ik, iv in injuries.items():
-        ik_parts = [p for p in ik.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
-        if ik_parts and ik_parts[-1] == last:
-            candidates.append(iv)
-    if not candidates:
-        return None
     team_u = normalize_abbrev(team)
-    if team_u:
-        same = [
-            c
-            for c in candidates
-            if normalize_abbrev(str(c.get("team_abbr") or "")) == team_u
-            or team_u.lower() in str(c.get("team") or "").lower()
-        ]
-        if same:
-            # Most severe
-            return min(same, key=lambda c: c.get("minutes_factor", 1.0))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+    if not team_u:
+        return None
+    same_team: list[dict[str, Any]] = []
+    for ik, iv in injuries.items():
+        if not _injury_team_matches(iv, team_u):
+            continue
+        ik_parts = [p for p in ik.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+        if not ik_parts or ik_parts[-1] != last:
+            continue
+        # Prefer first-initial agreement when both have a first name
+        if first and ik_parts[0] and ik_parts[0][0] != first[0]:
+            continue
+        same_team.append(iv)
+    if not same_team:
+        return None
+    return min(same_team, key=lambda c: c.get("minutes_factor", 1.0))
 
 
 def project_player_minutes(
@@ -686,6 +705,13 @@ def verify_matchup_personnel(
         g = g.sort_values("proj_minutes", ascending=False)
         top = g.head(8)
         injured = g[g["minutes_factor"] < 0.95].sort_values("proj_minutes", ascending=False)
+
+        def _status(val: Any) -> str:
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                return ""
+            s = str(val).strip()
+            return "" if s.lower() in {"nan", "none"} else s
+
         return {
             "team": abbr,
             "roster_size": int(len(g)),
@@ -694,14 +720,14 @@ def verify_matchup_personnel(
                     "player": str(r["player"]),
                     "proj_min": round(float(r["proj_minutes"] or 0), 1),
                     "adj_min": round(float(r["adj_minutes"] or 0), 1),
-                    "injury": r.get("injury_status") or "",
+                    "injury": _status(r.get("injury_status")),
                 }
                 for _, r in top.iterrows()
             ],
             "injury_flags": [
                 {
                     "player": str(r["player"]),
-                    "status": r.get("injury_status") or "",
+                    "status": _status(r.get("injury_status")),
                     "factor": float(r["minutes_factor"]),
                     "proj_min": round(float(r["proj_minutes"] or 0), 1),
                     "adj_min": round(float(r["adj_minutes"] or 0), 1),
