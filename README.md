@@ -68,7 +68,7 @@ config.py              knobs + paths
 4. **Context** — rest / B2B / travel miles / timezone + home court.
 5. **Injuries first** — official/ESPN status drives minutes → rating change before other layers.
 
-Win probability uses a logistic of expected margin (σ ≈ 12.5).
+Win probability comes from **10,000** Monte Carlo score simulations (configurable via `SIM_COUNT`) around mean projections. Team priors stay strong early (`PRIOR_BLEND_GAMES`, default 25); injuries adjust first; absolute player-impact is shrunk so tiny samples do not force coin-flips.
 
 ### Rosters / injuries / minutes
 

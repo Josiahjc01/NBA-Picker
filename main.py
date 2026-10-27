@@ -86,16 +86,24 @@ def format_markdown(
             f"### {pred['away_abbr']} @ {pred['home_abbr']}"
         )
         lines.append("")
+        nsim = pred.get("sim_count") or config.SIM_COUNT
         lines.append(
-            f"- **Projected score:** {pred['away_abbr']} {pred['away_pts']} – "
+            f"- **Mean score ({nsim} sims):** {pred['away_abbr']} {pred['away_pts']} - "
             f"{pred['home_abbr']} {pred['home_pts']} "
             f"(total {pred['total']}, margin {pred['margin']:+.1f} home)"
         )
         lines.append(
-            f"- **Win probability:** {pred['home_abbr']} {pred['home_win_prob']:.1%} · "
+            f"- **Win probability (sims):** {pred['home_abbr']} {pred['home_win_prob']:.1%} / "
             f"{pred['away_abbr']} {pred['away_win_prob']:.1%} "
             f"(confidence {pred['confidence']:.2f})"
         )
+        sims = pred.get("sims") or {}
+        if sims:
+            lines.append(
+                f"- **Score band p10-p90:** {pred['away_abbr']} "
+                f"{sims.get('away_pts_p10')}-{sims.get('away_pts_p90')} / "
+                f"{pred['home_abbr']} {sims.get('home_pts_p10')}-{sims.get('home_pts_p90')}"
+            )
         notes = pred.get("notes") or {}
         if notes.get("injuries"):
             lines.append("- **Injuries:** " + "; ".join(notes["injuries"]))
@@ -177,9 +185,11 @@ def print_terminal(
 
     for pred in predictions:
         print()
+        nsim = pred.get("sim_count") or config.SIM_COUNT
         print(f"  {pred['away_abbr']:3} @ {pred['home_abbr']:3}   "
-              f"{pred['away_pts']:5.1f} – {pred['home_pts']:5.1f}   "
-              f"P(home)={pred['home_win_prob']:.1%}  margin={pred['margin']:+.1f}")
+              f"{pred['away_pts']:5.1f} - {pred['home_pts']:5.1f}   "
+              f"P(home)={pred['home_win_prob']:.1%}  margin={pred['margin']:+.1f}  "
+              f"[{nsim} sims]")
         notes = pred.get("notes") or {}
         for label, key in (
             ("inj", "injuries"),

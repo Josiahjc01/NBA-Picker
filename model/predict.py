@@ -1,4 +1,4 @@
-"""Generate team ratings, projected scores, and win probabilities."""
+"""Generate team ratings, projected scores, win probs via 10k Monte Carlo."""
 
 from __future__ import annotations
 
@@ -15,9 +15,6 @@ from data.static_arenas import normalize_abbrev
 
 logger = logging.getLogger(__name__)
 
-# Logistic scale: ~ margin std of NBA games ≈ 12–13 pts
-MARGIN_SIGMA = 12.5
-
 
 def _team_row(ratings: pd.DataFrame, abbr: str) -> dict[str, float]:
     abbr = normalize_abbrev(abbr)
@@ -31,6 +28,7 @@ def _team_row(ratings: pd.DataFrame, abbr: str) -> dict[str, float]:
         "orb_pct": 0.28,
         "ft_rate": 0.25,
         "games": 0,
+        "blend_weight_current": 0.0,
     }
     if ratings is None or ratings.empty:
         return defaults
@@ -44,58 +42,106 @@ def _team_row(ratings: pd.DataFrame, abbr: str) -> dict[str, float]:
     return r
 
 
-def margin_to_win_prob(margin: float, sigma: float = MARGIN_SIGMA) -> float:
-    """P(home win) from expected margin (home − away) via normal CDF approx."""
-    # Φ(margin / sigma)
-    z = margin / max(sigma, 1e-6)
-    # logistic approximation to normal CDF
+def _finite(val: Any, default: float = 0.0) -> float:
+    try:
+        v = float(val)
+        return v if np.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def margin_to_win_prob(margin: float, sigma: float | None = None) -> float:
+    """P(home win) from expected margin via logistic approx to normal CDF."""
+    sig = sigma if sigma is not None else config.MARGIN_SIGMA
+    z = margin / max(sig, 1e-6)
     return float(1.0 / (1.0 + math.exp(-1.7 * z)))
 
 
-def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
+def _early_season_weight(games_n: int) -> float:
+    """How much to trust current-season sample vs durable prior (0..1)."""
+    k = float(max(config.PRIOR_BLEND_GAMES, 1))
+    return float(games_n / (games_n + k))
+
+
+def _mean_scores(
+    game: dict[str, Any],
+    features: dict[str, Any],
+) -> tuple[float, float, dict[str, Any]]:
+    """
+    Deterministic mean home/away points from durable team priors + injury-first
+    player layer. Absolute player impact is heavily shrunk so early-season
+    z-score noise cannot turn mismatches into coin-flips.
+    """
     ratings = features.get("ratings")
     home = normalize_abbrev(game.get("home_abbr"))
     away = normalize_abbrev(game.get("away_abbr"))
     hr = _team_row(ratings, home)
     ar = _team_row(ratings, away)
 
-    # Pace: average team possessions / game
-    pace = 0.5 * (float(hr["pace"]) + float(ar["pace"]))
-    pace = float(np.clip(pace, 90.0, 110.0))
+    games_n = min(int(hr.get("games") or 0), int(ar.get("games") or 0))
+    w_cur = _early_season_weight(games_n)
+    # Prefer explicit blend weight when present (from process.blend_with_prior)
+    w_h = _finite(hr.get("blend_weight_current"), w_cur)
+    w_a = _finite(ar.get("blend_weight_current"), w_cur)
+    w_sample = min(w_h, w_a, w_cur)
 
-    # Base ratings with player-impact adjustment (EPM-like points per 100 poss)
+    # Pace: blend toward league default early; coach/style proxy = sustained pace
+    pace_raw = 0.5 * (float(hr["pace"]) + float(ar["pace"]))
+    pace = (1.0 - w_sample) * config.DEFAULT_PACE + w_sample * pace_raw
+    pace = float(np.clip(0.5 * (pace_raw + pace), 92.0, 108.0))
+
     impact = features.get("team_impact") or {}
     hi = impact.get(home) or {}
     ai = impact.get(away) or {}
-    def _finite(val, default=0.0):
-        try:
-            v = float(val)
-            return v if np.isfinite(v) else default
-        except (TypeError, ValueError):
-            return default
 
-    h_pi = float(np.clip(_finite(hi.get("player_impact")), -12.0, 12.0))
-    a_pi = float(np.clip(_finite(ai.get("player_impact")), -12.0, 12.0))
-    h_off = float(np.clip(hr["off_rtg"], 95.0, 130.0)) + 0.5 * h_pi
-    h_def = float(np.clip(hr["def_rtg"], 95.0, 130.0)) - 0.25 * h_pi
-    a_off = float(np.clip(ar["off_rtg"], 95.0, 130.0)) + 0.5 * a_pi
-    a_def = float(np.clip(ar["def_rtg"], 95.0, 130.0)) - 0.25 * a_pi
+    # Team offense/defense from Net Rating stack (prior already blended in ratings)
+    h_off = float(np.clip(hr["off_rtg"], 98.0, 125.0))
+    h_def = float(np.clip(hr["def_rtg"], 98.0, 125.0))
+    a_off = float(np.clip(ar["off_rtg"], 98.0, 125.0))
+    a_def = float(np.clip(ar["def_rtg"], 98.0, 125.0))
 
-    # Four-factors soft nudge
-    h_off += 12.0 * (float(hr["efg"]) - 0.53) - 25.0 * (float(hr["tov_pct"]) - 0.13)
-    a_off += 12.0 * (float(ar["efg"]) - 0.53) - 25.0 * (float(ar["tov_pct"]) - 0.13)
+    # Four-factors soft nudge (scaled by sample trust)
+    ff = 0.35 + 0.65 * w_sample
+    h_off += ff * (12.0 * (float(hr["efg"]) - 0.53) - 25.0 * (float(hr["tov_pct"]) - 0.13))
+    a_off += ff * (12.0 * (float(ar["efg"]) - 0.53) - 25.0 * (float(ar["tov_pct"]) - 0.13))
+
+    # Injury-first: full injury_delta; talent residual heavily shrunk
+    h_inj = _finite(hi.get("injury_delta"))
+    a_inj = _finite(ai.get("injury_delta"))
+    h_talent = _finite(hi.get("healthy_impact"))
+    a_talent = _finite(ai.get("healthy_impact"))
+    talent_scale = config.PLAYER_TALENT_SHRINK * (0.25 + 0.75 * w_sample)
+    h_pi = h_inj + talent_scale * h_talent
+    a_pi = a_inj + talent_scale * a_talent
+    h_pi = float(np.clip(h_pi, -8.0, 8.0))
+    a_pi = float(np.clip(a_pi, -8.0, 8.0))
+
+    h_off += 0.55 * h_pi
+    h_def -= 0.25 * h_pi
+    a_off += 0.55 * a_pi
+    a_def -= 0.25 * a_pi
 
     league = config.DEFAULT_OFF_RTG
-    # Opp-adjusted points: own offense vs opponent defense around league average
-    home_pts = pace * (h_off - (a_def - league) * 0.5) / 100.0
-    away_pts = pace * (a_off - (h_def - league) * 0.5) / 100.0
+    # Opp-adjusted scoring
+    home_pts = pace * (h_off - (a_def - league) * 0.55) / 100.0
+    away_pts = pace * (a_off - (h_def - league) * 0.55) / 100.0
+
+    # SRS-style net pull so large Net Rating gaps show up in the margin
+    h_net = h_off - h_def
+    a_net = a_off - a_def
+    net_margin = 0.45 * (h_net - a_net)
+    home_pts += net_margin / 2.0
+    away_pts -= net_margin / 2.0
 
     ctx = features.get("context") or {}
     h_ctx = ctx.get(f"{game.get('game_id')}:{home}") or {}
     a_ctx = ctx.get(f"{game.get('game_id')}:{away}") or {}
-    # Split context so home-court lands mostly on home margin
-    home_pts += float(h_ctx.get("context_points") or (config.HOME_COURT_POINTS if not h_ctx else 0.0)) * 0.6
-    away_pts += float(a_ctx.get("context_points") or 0.0) * 0.6
+    # Full context (home court, B2B, travel) — do not damp to 0.6
+    home_pts += _finite(
+        h_ctx.get("context_points"),
+        config.HOME_COURT_POINTS if not h_ctx else 0.0,
+    )
+    away_pts += _finite(a_ctx.get("context_points"), 0.0)
 
     matchup_edge, matchup_notes = playtype_matchup_residual(
         features.get("play_types"), home, away
@@ -103,30 +149,134 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
     home_pts += matchup_edge / 2.0
     away_pts -= matchup_edge / 2.0
 
-    # Sanity clamp — NBA team scores rarely outside this band in projections
-    home_pts = float(np.clip(home_pts, 85.0, 145.0))
-    away_pts = float(np.clip(away_pts, 85.0, 145.0))
+    # Mild regression of totals toward league average early
+    total = home_pts + away_pts
+    league_tot = config.LEAGUE_AVG_TOTAL
+    total = (1.0 - 0.25 * (1.0 - w_sample)) * total + (0.25 * (1.0 - w_sample)) * league_tot
+    # Keep margin; rescale points to adjusted total
+    margin = home_pts - away_pts
+    home_pts = (total + margin) / 2.0
+    away_pts = (total - margin) / 2.0
 
-    # Injury priority already in player_impact; surface notes
+    home_pts = float(np.clip(home_pts, 88.0, 140.0))
+    away_pts = float(np.clip(away_pts, 88.0, 140.0))
+
+    meta = {
+        "home": home,
+        "away": away,
+        "hr": hr,
+        "ar": ar,
+        "hi": hi,
+        "ai": ai,
+        "h_off": h_off,
+        "h_def": h_def,
+        "a_off": a_off,
+        "a_def": a_def,
+        "h_pi": h_pi,
+        "a_pi": a_pi,
+        "pace": pace,
+        "w_sample": w_sample,
+        "games_n": games_n,
+        "matchup_edge": matchup_edge,
+        "matchup_notes": matchup_notes,
+        "h_ctx": h_ctx,
+        "a_ctx": a_ctx,
+    }
+    return home_pts, away_pts, meta
+
+
+def simulate_game(
+    mean_home: float,
+    mean_away: float,
+    *,
+    n: int | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """
+    Vectorized Monte Carlo: correlated score noise around mean projections.
+    Returns win rates + score distribution summaries (not extra scrapes).
+    """
+    n = int(n if n is not None else config.SIM_COUNT)
+    n = max(100, n)
+    rng = np.random.default_rng(seed)
+    sig = config.SCORE_SIGMA
+    # Correlation ~0.15 between team scores (pace/shared environment)
+    rho = 0.15
+    z = rng.standard_normal((n, 2))
+    z[:, 1] = rho * z[:, 0] + math.sqrt(max(0.0, 1.0 - rho * rho)) * z[:, 1]
+    home = mean_home + sig * z[:, 0]
+    away = mean_away + sig * z[:, 1]
+    # Floor
+    home = np.clip(home, 70.0, 160.0)
+    away = np.clip(away, 70.0, 160.0)
+    home_wins = home > away
+    ties = np.isclose(home, away)
+    # Ties → coin flip for win%
+    if ties.any():
+        flip = rng.random(ties.sum()) < 0.5
+        home_wins = home_wins.copy()
+        home_wins[ties] = flip
+
+    margins = home - away
+    totals = home + away
+    return {
+        "sim_count": n,
+        "home_win_prob": float(home_wins.mean()),
+        "away_win_prob": float(1.0 - home_wins.mean()),
+        "home_pts_mean": float(home.mean()),
+        "away_pts_mean": float(away.mean()),
+        "home_pts_p10": float(np.percentile(home, 10)),
+        "home_pts_p90": float(np.percentile(home, 90)),
+        "away_pts_p10": float(np.percentile(away, 10)),
+        "away_pts_p90": float(np.percentile(away, 90)),
+        "total_mean": float(totals.mean()),
+        "total_p10": float(np.percentile(totals, 10)),
+        "total_p90": float(np.percentile(totals, 90)),
+        "margin_mean": float(margins.mean()),
+        "margin_std": float(margins.std()),
+        "cover_home_minus_3": float((margins > 3.0).mean()),
+        "cover_home_minus_5": float((margins > 5.0).mean()),
+        "over_225": float((totals > 225.0).mean()),
+    }
+
+
+def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
+    home_pts, away_pts, meta = _mean_scores(game, features)
+    home = meta["home"]
+    away = meta["away"]
+    hr, ar = meta["hr"], meta["ar"]
+    hi, ai = meta["hi"], meta["ai"]
+
+    # Deterministic seed from game_id for stable re-runs
+    gid = str(game.get("game_id") or f"{away}{home}{game.get('game_date')}")
+    seed = abs(hash(gid)) % (2**32 - 1)
+    sims = simulate_game(home_pts, away_pts, seed=seed)
+
+    # Prefer sim win% ; mean scores from sims (close to analytic means)
+    win_p = sims["home_win_prob"]
+    mean_h = sims["home_pts_mean"]
+    mean_a = sims["away_pts_mean"]
+    margin = mean_h - mean_a
+
+    games_n = meta["games_n"]
+    confidence = float(np.clip(0.40 + 0.025 * games_n, 0.40, 0.88))
+    confidence *= 0.85 + 0.15 * meta["w_sample"]
+    if abs(margin) < 2.0:
+        confidence = min(confidence, 0.55)
+    if abs(margin) >= 6.0:
+        confidence = min(0.9, confidence + 0.08)
+
     injury_notes = list(hi.get("injury_notes") or []) + list(ai.get("injury_notes") or [])
-    # Biggest injury deltas
     if hi.get("injury_delta"):
         injury_notes.insert(0, f"{home} injury dNet {hi['injury_delta']:+.2f}")
     if ai.get("injury_delta"):
         injury_notes.insert(0, f"{away} injury dNet {ai['injury_delta']:+.2f}")
 
-    margin = home_pts - away_pts
-    win_p = margin_to_win_prob(margin)
-
-    # Confidence: more games + fewer missing layers → higher
-    games_n = min(int(hr.get("games") or 0), int(ar.get("games") or 0))
-    confidence = float(np.clip(0.35 + 0.05 * games_n, 0.35, 0.9))
-    if not (features.get("team_impact")):
-        confidence *= 0.85
-    if injury_notes:
-        confidence = min(confidence, 0.75)
-
-    flags = list(dict.fromkeys((h_ctx.get("flags") or []) + (a_ctx.get("flags") or [])))
+    flags = list(
+        dict.fromkeys(
+            (meta["h_ctx"].get("flags") or []) + (meta["a_ctx"].get("flags") or [])
+        )
+    )
 
     return {
         "game_id": game.get("game_id"),
@@ -135,27 +285,40 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
         "away_abbr": away,
         "home_name": game.get("home_name") or home,
         "away_name": game.get("away_name") or away,
-        "home_pts": round(home_pts, 1),
-        "away_pts": round(away_pts, 1),
-        "total": round(home_pts + away_pts, 1),
+        "home_pts": round(mean_h, 1),
+        "away_pts": round(mean_a, 1),
+        "total": round(mean_h + mean_a, 1),
         "margin": round(margin, 1),
         "home_win_prob": round(win_p, 4),
         "away_win_prob": round(1.0 - win_p, 4),
         "confidence": round(confidence, 3),
-        "pace": round(pace, 1),
+        "pace": round(meta["pace"], 1),
+        "sim_count": sims["sim_count"],
+        "sims": {
+            "home_pts_p10": round(sims["home_pts_p10"], 1),
+            "home_pts_p90": round(sims["home_pts_p90"], 1),
+            "away_pts_p10": round(sims["away_pts_p10"], 1),
+            "away_pts_p90": round(sims["away_pts_p90"], 1),
+            "total_p10": round(sims["total_p10"], 1),
+            "total_p90": round(sims["total_p90"], 1),
+            "margin_std": round(sims["margin_std"], 2),
+        },
         "notes": {
             "injuries": injury_notes[:6],
             "rest_travel": flags,
-            "play_types": matchup_notes,
+            "play_types": meta["matchup_notes"],
         },
         "components": {
-            "home_off": round(h_off, 2),
-            "home_def": round(h_def, 2),
-            "away_off": round(a_off, 2),
-            "away_def": round(a_def, 2),
-            "matchup_residual": round(matchup_edge, 2),
-            "home_player_impact": round(float(hi.get("player_impact") or 0.0), 3),
-            "away_player_impact": round(float(ai.get("player_impact") or 0.0), 3),
+            "home_off": round(meta["h_off"], 2),
+            "home_def": round(meta["h_def"], 2),
+            "away_off": round(meta["a_off"], 2),
+            "away_def": round(meta["a_def"], 2),
+            "matchup_residual": round(meta["matchup_edge"], 2),
+            "home_player_impact": round(meta["h_pi"], 3),
+            "away_player_impact": round(meta["a_pi"], 3),
+            "sample_weight": round(meta["w_sample"], 3),
+            "home_net": round(meta["h_off"] - meta["h_def"], 2),
+            "away_net": round(meta["a_off"] - meta["a_def"], 2),
         },
     }
 
