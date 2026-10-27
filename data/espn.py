@@ -212,8 +212,81 @@ def team_season_stats() -> list[dict[str, Any]]:
     return rows
 
 
-def player_stats(limit_pages: int = 7) -> list[dict[str, Any]]:
-    """League player per-game stats including minutes."""
+def team_rosters() -> list[dict[str, Any]]:
+    """Current ESPN team rosters (active + two-ways as listed)."""
+    rows: list[dict[str, Any]] = []
+    for t in list_teams():
+        try:
+            data = _get(f"{SITE}/teams/{t['id']}/roster")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ESPN roster %s failed: %s", t["abbr"], exc)
+            continue
+        for a in data.get("athletes") or []:
+            name = a.get("displayName") or a.get("fullName")
+            if not name:
+                continue
+            status = a.get("status")
+            if isinstance(status, dict):
+                status_type = status.get("type") or status.get("name") or ""
+            else:
+                status_type = str(status or "active")
+            pos = a.get("position") or {}
+            rows.append(
+                {
+                    "PLAYER_NAME": name,
+                    "TEAM_ABBREVIATION": t["abbr"],
+                    "TEAM_NAME": t["name"],
+                    "PLAYER_ID": str(a.get("id") or ""),
+                    "POSITION": pos.get("abbreviation") or pos.get("name") or "",
+                    "STATUS": str(status_type).lower() or "active",
+                    "SOURCE": "espn_roster",
+                }
+            )
+    return rows
+
+
+def injuries_api() -> list[dict[str, Any]]:
+    """Structured injury report from ESPN site API (preferred over HTML scrape)."""
+    data = _get(f"{SITE}/injuries")
+    teams = {t["name"]: t["abbr"] for t in list_teams()}
+    # Also index short names
+    for t in list_teams():
+        if t.get("short"):
+            teams[t["short"]] = t["abbr"]
+    out: list[dict[str, Any]] = []
+    for group in data.get("injuries") or []:
+        team_name = group.get("displayName") or ""
+        team_abbr = teams.get(team_name) or normalize_abbrev(group.get("id"))
+        # id is often ESPN team id numeric — map via list_teams ids
+        if not team_abbr or team_abbr.isdigit():
+            tid = str(group.get("id") or "")
+            hit = next((t for t in list_teams() if t["id"] == tid), None)
+            team_abbr = hit["abbr"] if hit else ""
+        for inj in group.get("injuries") or []:
+            athlete = inj.get("athlete") or {}
+            player = athlete.get("displayName") or (
+                f"{athlete.get('firstName', '')} {athlete.get('lastName', '')}".strip()
+            )
+            if not player:
+                continue
+            status = str(inj.get("status") or "").strip()
+            comment = str(inj.get("shortComment") or inj.get("longComment") or "")
+            out.append(
+                {
+                    "team": team_name,
+                    "team_abbr": team_abbr,
+                    "player": player,
+                    "status": status,
+                    "comment": comment,
+                    "date": inj.get("date"),
+                    "source": "espn_api",
+                }
+            )
+    return out
+
+
+def player_stats(limit_pages: int = 12) -> list[dict[str, Any]]:
+    """League player per-game stats including minutes (paginate for fuller coverage)."""
     page = 1
     rows: list[dict[str, Any]] = []
     labels_by_cat: dict[str, list[str]] = {}
@@ -290,15 +363,10 @@ def player_stats(limit_pages: int = 7) -> list[dict[str, Any]]:
 
 def _roster_name_to_team() -> dict[str, str]:
     mapping: dict[str, str] = {}
-    for t in list_teams():
-        try:
-            data = _get(f"{SITE}/teams/{t['id']}/roster")
-        except Exception:  # noqa: BLE001
-            continue
-        for a in data.get("athletes") or []:
-            name = (a.get("displayName") or a.get("fullName") or "").lower()
-            if name:
-                mapping[name] = t["abbr"]
+    for r in team_rosters():
+        name = (r.get("PLAYER_NAME") or "").lower()
+        if name:
+            mapping[name] = r["TEAM_ABBREVIATION"]
     return mapping
 
 

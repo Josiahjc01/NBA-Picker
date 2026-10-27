@@ -12,7 +12,7 @@ from pathlib import Path
 
 import config
 from data.fetch import fetch_all
-from data.process import build_features
+from data.process import build_features, verify_matchup_personnel
 from model.brief import (
     enrich_predictions_with_brief,
     format_ai_paste,
@@ -43,6 +43,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Launch the desktop UI (same as python gui.py)",
     )
+    p.add_argument("--away", default=None, help="Away team abbr (with --home filters one matchup)")
+    p.add_argument("--home", default=None, help="Home team abbr (with --away filters one matchup)")
     return p.parse_args(argv)
 
 
@@ -129,7 +131,38 @@ def _print_team_season(season: dict) -> None:
         print(f"        {title}: {joined}")
 
 
-def print_terminal(target: date, predictions: list[dict], ai_paste: str | None = None) -> None:
+def _print_personnel(personnel: dict | None) -> None:
+    if not personnel:
+        return
+    print()
+    print("-" * 64)
+    print(" PERSONNEL CHECK (roster / injuries / minutes)")
+    print("-" * 64)
+    for side in ("away", "home"):
+        s = personnel.get(side) or {}
+        if not s or s.get("error"):
+            continue
+        print(f"  {s.get('team')}: roster {s.get('roster_size')}")
+        for p in (s.get("key_players") or [])[:5]:
+            flag = f"  [{p['injury']}]" if p.get("injury") else ""
+            print(
+                f"    {p['player']:22}  {p['proj_min']:5.1f} → {p['adj_min']:5.1f} min{flag}"
+            )
+        for p in (s.get("injury_flags") or [])[:4]:
+            if p.get("player") in {k["player"] for k in (s.get("key_players") or [])[:5]}:
+                continue
+            print(
+                f"    ! {p['player']:20}  {p.get('status')}  "
+                f"{p['proj_min']:.0f}→{p['adj_min']:.0f}"
+            )
+
+
+def print_terminal(
+    target: date,
+    predictions: list[dict],
+    ai_paste: str | None = None,
+    personnel: dict | None = None,
+) -> None:
     print()
     print("=" * 64)
     print(f" NBA PICKER  ·  {target.isoformat()}")
@@ -161,12 +194,12 @@ def print_terminal(target: date, predictions: list[dict], ai_paste: str | None =
             if season.get(side):
                 _print_team_season(season[side])
 
+    _print_personnel(personnel)
     if ai_paste:
         print()
         print("-" * 64)
         print(" AI PASTE (also written to output/ai_paste_*.txt)")
         print("-" * 64)
-        # Keep terminal short — point at file; still show first game header
         print("  Copy the AI paste file into another AI for wager ideas.")
     print()
 
@@ -220,9 +253,11 @@ def run_pipeline(
     features = build_features(raw, target)
     predictions = enrich_predictions_with_brief(predict_slate(features), features)
 
+    personnel = None
     if matchup:
         away_m = matchup[0].upper()
         home_m = matchup[1].upper()
+        personnel = verify_matchup_personnel(features, away_m, home_m)
         predictions = [
             p
             for p in predictions
@@ -239,6 +274,8 @@ def run_pipeline(
         ]
 
     meta = raw.get("meta") or {}
+    if personnel:
+        meta = {**meta, "personnel_verify": personnel}
     ai_paste = format_ai_paste(target.isoformat(), predictions)
     payload = {
         "date": target.isoformat(),
@@ -246,6 +283,7 @@ def run_pipeline(
         "meta": meta,
         "predictions": predictions,
         "ai_paste": ai_paste,
+        "personnel_verify": personnel,
     }
     md = format_markdown(target, predictions, meta)
     payload["markdown"] = md
@@ -258,10 +296,20 @@ def run_pipeline(
     return payload
 
 
-def run(target: date, force: bool = False) -> int:
-    payload = run_pipeline(target, force=force)
+def run(
+    target: date,
+    force: bool = False,
+    *,
+    matchup: tuple[str, str] | None = None,
+) -> int:
+    payload = run_pipeline(target, force=force, matchup=matchup)
     predictions = payload["predictions"]
-    print_terminal(target, predictions, payload.get("ai_paste"))
+    print_terminal(
+        target,
+        predictions,
+        payload.get("ai_paste"),
+        payload.get("personnel_verify"),
+    )
     if payload.get("md_path"):
         print(f"Wrote {payload['md_path']}")
     if payload.get("json_path"):
@@ -284,8 +332,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         print(f"Invalid --date: {args.game_date!r} (use YYYY-MM-DD)", file=sys.stderr)
         return 2
+    matchup = None
+    if args.away or args.home:
+        if not (args.away and args.home):
+            print("Provide both --away and --home", file=sys.stderr)
+            return 2
+        matchup = (args.away.upper(), args.home.upper())
     try:
-        return run(target, force=args.force_refresh)
+        return run(target, force=args.force_refresh, matchup=matchup)
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
         return 130
