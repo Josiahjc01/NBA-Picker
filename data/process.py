@@ -318,11 +318,17 @@ def blend_with_prior(
         return current.copy()
 
     prior_idx = prior.set_index("team")
+    early = float(max(config.EARLY_SEASON_GAMES, 1))
     out = []
     for _, row in current.iterrows():
         team = row["team"]
         games = int(row.get("games") or 0)
-        w = min(1.0, games / float(n_blend))
+        # Stronger prior trust below EARLY_SEASON_GAMES (quadratic soft ramp)
+        if games < early:
+            w = (games / early) ** 2 * (early / float(n_blend))
+        else:
+            w = min(1.0, games / float(n_blend))
+        w = float(np.clip(w, 0.0, 1.0))
         if team in prior_idx.index:
             p = prior_idx.loc[team]
             blended = row.to_dict()
@@ -345,6 +351,282 @@ def blend_with_prior(
             d["blend_weight_current"] = 0.0
             out.append(d)
     return pd.DataFrame(out)
+
+
+def build_team_form(
+    team_logs: pd.DataFrame,
+    *,
+    last_n: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Hot/cold from last-N net margin / scoring vs season averages.
+    Returns per-team form_edge (points, capped) + notes when material.
+    """
+    last_n = last_n or config.FORM_LAST_N
+    out: dict[str, dict[str, Any]] = {}
+    if team_logs is None or (isinstance(team_logs, pd.DataFrame) and team_logs.empty):
+        return out
+
+    df = team_logs.copy()
+    colmap = {c.upper(): c for c in df.columns}
+
+    def col(*names: str) -> str | None:
+        for n in names:
+            if n in df.columns:
+                return n
+            if n.upper() in colmap:
+                return colmap[n.upper()]
+        return None
+
+    team_c = col("TEAM_ABBREVIATION", "team_abbreviation")
+    date_c = col("GAME_DATE", "game_date")
+    pts_c = col("PTS", "pts")
+    plus_c = col("PLUS_MINUS", "plus_minus")
+    if not team_c or not date_c or not pts_c:
+        return out
+
+    df["_date"] = df[date_c].apply(_parse_game_date)
+    df = df.dropna(subset=["_date"]).sort_values("_date")
+    df["_abbr"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
+    df["_pts"] = pd.to_numeric(df[pts_c], errors="coerce")
+    if plus_c:
+        df["_pm"] = pd.to_numeric(df[plus_c], errors="coerce")
+    else:
+        df["_pm"] = np.nan
+
+    for abbr, g in df.groupby("_abbr"):
+        g = g.dropna(subset=["_pts"]).sort_values("_date")
+        if len(g) < 3:
+            continue
+        season_margin = float(g["_pm"].mean()) if g["_pm"].notna().any() else 0.0
+        season_pts = float(g["_pts"].mean())
+        recent = g.tail(last_n)
+        recent_margin = float(recent["_pm"].mean()) if recent["_pm"].notna().any() else season_margin
+        recent_pts = float(recent["_pts"].mean())
+        # Form signal: margin gap + mild scoring gap (offense heat)
+        margin_gap = recent_margin - season_margin
+        pts_gap = recent_pts - season_pts
+        raw = 0.55 * margin_gap + 0.20 * pts_gap
+        edge = float(np.clip(raw, -config.FORM_EDGE_CAP, config.FORM_EDGE_CAP))
+        # Streak: consecutive W/L at end of log
+        streak = 0
+        if plus_c and recent["_pm"].notna().any():
+            signs = list(recent["_pm"].dropna().map(lambda x: 1 if x > 0 else -1))
+            if signs:
+                streak = signs[-1]
+                for s in reversed(signs[:-1]):
+                    if s == signs[-1]:
+                        streak += signs[-1]
+                    else:
+                        break
+        tag = "NEUTRAL"
+        if edge >= 1.25 or streak >= 3:
+            tag = "HOT"
+            # Streak-only heat still moves the needle a little
+            if edge < 1.25:
+                edge = max(edge, min(1.5, 0.45 * abs(streak)))
+        elif edge <= -1.25 or streak <= -3:
+            tag = "COLD"
+            if edge > -1.25:
+                edge = min(edge, -min(1.5, 0.45 * abs(streak)))
+        edge = float(np.clip(edge, -config.FORM_EDGE_CAP, config.FORM_EDGE_CAP))
+        note = None
+        if tag != "NEUTRAL":
+            note = (
+                f"{abbr} {tag}: last {len(recent)}g margin {recent_margin:+.1f} "
+                f"(szn {season_margin:+.1f}), pts {recent_pts:.1f}"
+                + (f", streak {streak:+d}" if abs(streak) >= 3 else "")
+            )
+        out[str(abbr)] = {
+            "team": abbr,
+            "tag": tag,
+            "form_edge": round(edge, 2),
+            "recent_margin": round(recent_margin, 2),
+            "season_margin": round(season_margin, 2),
+            "recent_pts": round(recent_pts, 1),
+            "season_pts": round(season_pts, 1),
+            "streak": int(streak),
+            "n": int(len(recent)),
+            "note": note,
+        }
+    return out
+
+
+def build_home_road_splits(team_logs: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """Home vs road offensive/defensive scoring splits (points vs own average)."""
+    out: dict[str, dict[str, Any]] = {}
+    if team_logs is None or (isinstance(team_logs, pd.DataFrame) and team_logs.empty):
+        return out
+
+    df = team_logs.copy()
+    colmap = {c.upper(): c for c in df.columns}
+    team_c = colmap.get("TEAM_ABBREVIATION") or ("TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in df.columns else None)
+    match_c = colmap.get("MATCHUP") or ("MATCHUP" if "MATCHUP" in df.columns else None)
+    pts_c = colmap.get("PTS") or ("PTS" if "PTS" in df.columns else None)
+    plus_c = colmap.get("PLUS_MINUS") or ("PLUS_MINUS" if "PLUS_MINUS" in df.columns else None)
+    if not team_c or not pts_c:
+        return out
+
+    df["_abbr"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
+    df["_pts"] = pd.to_numeric(df[pts_c], errors="coerce")
+    if plus_c:
+        df["_pm"] = pd.to_numeric(df[plus_c], errors="coerce")
+        df["_opp"] = df["_pts"] - df["_pm"]
+    else:
+        df["_opp"] = np.nan
+
+    def _is_home(row: pd.Series) -> bool | None:
+        if match_c and isinstance(row.get(match_c), str):
+            m = str(row[match_c])
+            if "@" in m:
+                return False
+            if "vs" in m.lower():
+                return True
+        return None
+
+    df["_home"] = df.apply(_is_home, axis=1)
+    df = df.dropna(subset=["_pts", "_home"])
+    for abbr, g in df.groupby("_abbr"):
+        home = g[g["_home"] == True]  # noqa: E712
+        road = g[g["_home"] == False]  # noqa: E712
+        if len(home) < 2 or len(road) < 2:
+            continue
+        h_pts, r_pts = float(home["_pts"].mean()), float(road["_pts"].mean())
+        h_opp = float(home["_opp"].mean()) if home["_opp"].notna().any() else None
+        r_opp = float(road["_opp"].mean()) if road["_opp"].notna().any() else None
+        # Offense: home scoring boost vs road; Defense: points allowed (lower better)
+        off_split = h_pts - r_pts
+        def_split = 0.0
+        if h_opp is not None and r_opp is not None:
+            def_split = r_opp - h_opp  # positive => better home defense
+        out[str(abbr)] = {
+            "team": abbr,
+            "home_pts": round(h_pts, 1),
+            "road_pts": round(r_pts, 1),
+            "home_opp": round(h_opp, 1) if h_opp is not None else None,
+            "road_opp": round(r_opp, 1) if r_opp is not None else None,
+            "off_split": round(off_split, 2),
+            "def_split": round(def_split, 2),
+            "home_n": int(len(home)),
+            "road_n": int(len(road)),
+        }
+    return out
+
+
+def home_road_matchup_residual(
+    splits: dict[str, dict[str, Any]],
+    home: str,
+    away: str,
+) -> tuple[float, list[str]]:
+    """Small residual from home/road offense-defense splits for this venue."""
+    if not splits:
+        return 0.0, []
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+    hs = splits.get(home) or {}
+    as_ = splits.get(away) or {}
+    notes: list[str] = []
+    edge = 0.0
+    # Home team plays at home: use half of their home-road off/def split
+    if hs:
+        off = 0.25 * float(hs.get("off_split") or 0.0)
+        deff = 0.20 * float(hs.get("def_split") or 0.0)
+        edge += off + deff
+        if abs(hs.get("off_split") or 0) >= 4.0:
+            notes.append(
+                f"{home} home off {hs.get('home_pts')} vs road {hs.get('road_pts')}"
+            )
+    # Away team on road: suppress by their home-road gap
+    if as_:
+        off = -0.25 * float(as_.get("off_split") or 0.0)
+        deff = -0.15 * float(as_.get("def_split") or 0.0)
+        edge += off + deff
+        if abs(as_.get("off_split") or 0) >= 4.0:
+            notes.append(
+                f"{away} road off {as_.get('road_pts')} vs home {as_.get('home_pts')}"
+            )
+    edge = float(np.clip(edge, -config.HOME_ROAD_EDGE_CAP, config.HOME_ROAD_EDGE_CAP))
+    return edge, notes[:2]
+
+
+def build_quarter_profiles(quarter_logs: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """Per-team average Q1-Q4 scoring and opponent allowed."""
+    out: dict[str, dict[str, Any]] = {}
+    if quarter_logs is None or (isinstance(quarter_logs, pd.DataFrame) and quarter_logs.empty):
+        return out
+    df = quarter_logs.copy()
+    team_c = "TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in df.columns else None
+    if not team_c:
+        return out
+    df["_abbr"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
+    for abbr, g in df.groupby("_abbr"):
+        prof: dict[str, Any] = {"team": abbr, "games": int(len(g))}
+        for q in (1, 2, 3, 4):
+            col = f"Q{q}"
+            opp = f"OPP_Q{q}"
+            if col in g.columns:
+                s = pd.to_numeric(g[col], errors="coerce").dropna()
+                prof[f"q{q}_pts"] = float(s.mean()) if len(s) else None
+            if opp in g.columns:
+                s = pd.to_numeric(g[opp], errors="coerce").dropna()
+                prof[f"q{q}_opp"] = float(s.mean()) if len(s) else None
+        out[str(abbr)] = prof
+    return out
+
+
+def quarter_matchup_residual(
+    profiles: dict[str, dict[str, Any]],
+    home: str,
+    away: str,
+    *,
+    clutch: bool = False,
+) -> tuple[float, list[str]]:
+    """
+    Matchup residual from quarter scoring tendencies.
+    offense_q(home) - defense_q(away) style, heavily shrunk.
+    When clutch=True (close game), overweight Q4.
+    """
+    if not profiles:
+        return 0.0, []
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+    hp = profiles.get(home) or {}
+    ap = profiles.get(away) or {}
+    if not hp or not ap:
+        return 0.0, []
+
+    # League-ish quarter average ~28
+    lg = 28.0
+    notes: list[str] = []
+    edge = 0.0
+    weights = {1: 0.22, 2: 0.22, 3: 0.22, 4: 0.34}
+    if clutch:
+        weights = {1: 0.15, 2: 0.15, 3: 0.20, 4: 0.50}
+
+    for q, w in weights.items():
+        h_off = hp.get(f"q{q}_pts")
+        a_off = ap.get(f"q{q}_pts")
+        h_def = hp.get(f"q{q}_opp")  # points allowed
+        a_def = ap.get(f"q{q}_opp")
+        if h_off is None or a_def is None or a_off is None or h_def is None:
+            continue
+        # Points-allowed: higher = weaker defense, so it ADDS to opponent offense edge
+        h_edge = (float(h_off) - lg) + (float(a_def) - lg)
+        a_edge = (float(a_off) - lg) + (float(h_def) - lg)
+        q_edge = 0.10 * (h_edge - a_edge)  # shrink
+        if clutch and q == 4:
+            q_edge *= config.CLUTCH_Q4_MULT
+        edge += w * q_edge
+        if abs(h_edge - a_edge) >= 4.0:
+            notes.append(
+                f"Q{q}: {home} off {float(h_off):.1f} vs {away} allow {float(a_def):.1f}"
+                f" / {away} off {float(a_off):.1f} vs {home} allow {float(h_def):.1f}"
+            )
+
+    edge = float(np.clip(edge, -config.QUARTER_EDGE_CAP, config.QUARTER_EDGE_CAP))
+    if clutch and abs(edge) >= 0.3:
+        notes.insert(0, f"Clutch Q4 weighting on (projected close)")
+    return edge, notes[:3]
 
 
 def _injury_team_matches(inj: dict[str, Any], team: str) -> bool:
@@ -522,10 +804,22 @@ def rest_and_travel_context(
     games: list[dict[str, Any]],
     team_logs: pd.DataFrame,
     target: date,
+    ratings: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Per-team rest days, B2B, travel miles, TZ shift into today's venue."""
+    """Per-team rest days, B2B, travel miles, TZ shift into today's venue.
+
+    Also returns pace_adj: tired teams (B2B / short rest) play slower; well-rested
+    slightly faster — applied in the projection pace layer.
+    """
     last_game: dict[str, date] = {}
     last_venue: dict[str, str] = {}
+    pace_by_team: dict[str, float] = {}
+    if ratings is not None and not ratings.empty and "team" in ratings.columns:
+        for _, r in ratings.iterrows():
+            try:
+                pace_by_team[normalize_abbrev(str(r["team"]))] = float(r.get("pace") or config.DEFAULT_PACE)
+            except (TypeError, ValueError):
+                continue
 
     if team_logs is not None and not team_logs.empty:
         df = team_logs.copy()
@@ -568,20 +862,32 @@ def rest_and_travel_context(
             tz = timezone_shift_hours(prev_venue, home)
             # Point residual: B2B / travel / TZ (small)
             adj = 0.0
+            pace_adj = 0.0  # possessions delta
             flags = []
+            team_pace = pace_by_team.get(team, config.DEFAULT_PACE)
             if b2b:
                 adj -= 1.5
+                # Tired teams slow down more if they normally push pace
+                pace_adj -= 1.2 + 0.04 * max(0.0, team_pace - config.DEFAULT_PACE)
                 flags.append("B2B")
+                flags.append("tired-pace")
+            elif rest <= 1:
+                adj -= 0.6
+                pace_adj -= 0.6
+                flags.append(f"rest={rest}d")
             elif rest >= 3:
                 adj += 0.3
+                pace_adj += 0.4
                 flags.append(f"rest={rest}d")
             else:
                 flags.append(f"rest={rest}d")
             if miles >= 1500:
                 adj -= 0.8
+                pace_adj -= 0.5
                 flags.append(f"travel={miles:.0f}mi")
             elif miles >= 800:
                 adj -= 0.4
+                pace_adj -= 0.25
                 flags.append(f"travel={miles:.0f}mi")
             if abs(tz) >= 2:
                 adj -= 0.4 * abs(tz) / 2
@@ -599,6 +905,7 @@ def rest_and_travel_context(
                 "travel_miles": miles,
                 "tz_shift": tz,
                 "context_points": adj,
+                "pace_adj": float(np.clip(pace_adj, -3.0, 2.0)),
                 "flags": flags,
             }
     return ctx
@@ -675,13 +982,26 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         if ratings is None or ratings.empty:
             ratings = espn_seed
         else:
-            ratings = blend_with_prior(ratings, espn_seed, n_blend=max(config.PRIOR_BLEND_GAMES, 1))
+            # Keep prior heavier when sample is thin
+            ratings = blend_with_prior(
+                ratings,
+                espn_seed,
+                n_blend=max(config.PRIOR_BLEND_GAMES, config.EARLY_SEASON_GAMES * 2),
+            )
 
     players = align_players_to_rosters(raw.get("players"), raw.get("rosters") or [])
     inj_idx = index_injuries(raw.get("injuries") or [])
     minutes = project_player_minutes(players, inj_idx)
     impact = team_impact_from_players(minutes, raw.get("impact") or [])
-    context = rest_and_travel_context(raw.get("games") or [], raw.get("team_logs"), target)
+    context = rest_and_travel_context(
+        raw.get("games") or [],
+        raw.get("team_logs"),
+        target,
+        ratings=ratings,
+    )
+    team_form = build_team_form(raw.get("team_logs"))
+    home_road = build_home_road_splits(raw.get("team_logs"))
+    quarter_profiles = build_quarter_profiles(raw.get("quarter_logs"))
 
     return {
         "ratings": ratings,
@@ -689,6 +1009,10 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         "minutes": minutes,
         "team_impact": impact,
         "context": context,
+        "team_form": team_form,
+        "player_form": raw.get("player_form") or {},
+        "home_road": home_road,
+        "quarter_profiles": quarter_profiles,
         "play_types": raw.get("play_types"),
         "games": raw.get("games") or [],
         "team_logs": raw.get("team_logs"),

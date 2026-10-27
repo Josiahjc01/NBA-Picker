@@ -201,12 +201,19 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
     Plain, paste-friendly block for an external AI to suggest wagers from.
     Includes model projections plus season win%, avg totals, and player leaders.
     """
+    sim_n = next(
+        (p.get("sim_count") for p in predictions if p.get("sim_count")),
+        10000,
+    )
     lines = [
         "NBA PICKER — AI PASTE CONTEXT",
         f"Slate date: {target_date}",
+        f"Monte Carlo sims per game: n={sim_n}",
         "",
         "Use the season rates and player leaders below (with model projections) "
         "to suggest good wagers. This app does not fetch book odds.",
+        "Tags: HOT/COLD = recent form; quarter edges = Q1-Q4 tendency matchup; "
+        "clutch Q4 = close-game weighting.",
         "",
     ]
     if not predictions:
@@ -222,16 +229,22 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
         lines.append("=" * 56)
         lines.append("")
         lines.append("Model projection")
+        nsim = pred.get("sim_count") or sim_n
         lines.append(
-            f"- Mean score ({pred.get('sim_count') or 'sim'} runs): "
+            f"- Mean score (sim n={nsim}): "
             f"{away} {pred.get('away_pts')} - {home} {pred.get('home_pts')} "
             f"(total {pred.get('total')}, margin {pred.get('margin'):+.1f} home)"
         )
         lines.append(
-            f"- Win probability (sims): {home} {float(pred.get('home_win_prob') or 0):.1%} / "
+            f"- Win probability (sims n={nsim}): {home} {float(pred.get('home_win_prob') or 0):.1%} / "
             f"{away} {float(pred.get('away_win_prob') or 0):.1%} "
             f"(confidence {pred.get('confidence')})"
         )
+        tags = pred.get("form_tags") or []
+        if tags:
+            lines.append("- Form tags: " + ", ".join(tags))
+        if pred.get("clutch_q4"):
+            lines.append("- Clutch: Q4 weighting ON (projected close game)")
         sims = pred.get("sims") or {}
         if sims:
             lines.append(
@@ -240,6 +253,10 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
                 f"(total {sims.get('total_p10')}-{sims.get('total_p90')})"
             )
         notes = pred.get("notes") or {}
+        if notes.get("form"):
+            lines.append("- Hot/cold: " + "; ".join(notes["form"]))
+        if notes.get("quarters"):
+            lines.append("- Quarter edges: " + "; ".join(notes["quarters"]))
         if notes.get("injuries"):
             lines.append("- Injuries: " + "; ".join(notes["injuries"]))
         if notes.get("rest_travel"):
@@ -291,8 +308,9 @@ def format_ai_paste_markdown(target_date: str, predictions: list[dict[str, Any]]
         home = pred.get("home_abbr")
         lines.append(f"### {away} @ {home}")
         lines.append("")
+        nsim = pred.get("sim_count") or 10000
         lines.append(
-            f"- **Model score:** {away} {pred.get('away_pts')} – "
+            f"- **Model score (sim n={nsim}):** {away} {pred.get('away_pts')} – "
             f"{home} {pred.get('home_pts')} "
             f"(total {pred.get('total')}, margin {pred.get('margin'):+.1f} home)"
         )
@@ -300,6 +318,16 @@ def format_ai_paste_markdown(target_date: str, predictions: list[dict[str, Any]]
             f"- **Model win %:** {home} {float(pred.get('home_win_prob') or 0):.1%} · "
             f"{away} {float(pred.get('away_win_prob') or 0):.1%}"
         )
+        tags = pred.get("form_tags") or []
+        if tags:
+            lines.append(f"- **Form tags:** {', '.join(tags)}")
+        notes = pred.get("notes") or {}
+        if notes.get("form"):
+            lines.append("- **Hot/cold:** " + "; ".join(notes["form"]))
+        if notes.get("quarters"):
+            lines.append("- **Quarter edges:** " + "; ".join(notes["quarters"]))
+        if pred.get("clutch_q4"):
+            lines.append("- **Clutch Q4 weighting:** on (projected close)")
         lines.append("")
         season = pred.get("season") or {}
         for side in ("away", "home"):

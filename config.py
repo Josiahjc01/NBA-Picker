@@ -22,6 +22,32 @@ CACHE_MAX_AGE_HOURS = float(os.getenv("CACHE_MAX_AGE_HOURS", "6"))
 # EWM / blend knobs — prior stays strong until ~PRIOR_BLEND_GAMES
 EWM_SPAN = int(os.getenv("EWM_SPAN", "15"))
 PRIOR_BLEND_GAMES = int(os.getenv("PRIOR_BLEND_GAMES", "25"))
+# Extra-strong prior weight when both teams have fewer than this many games
+EARLY_SEASON_GAMES = int(os.getenv("EARLY_SEASON_GAMES", "10"))
+
+# Hot/cold form (last-N vs season EWM)
+FORM_LAST_N = int(os.getenv("FORM_LAST_N", "5"))
+FORM_EDGE_CAP = float(os.getenv("FORM_EDGE_CAP", "3.0"))
+FORM_PLAYER_PTS_DELTA = float(os.getenv("FORM_PLAYER_PTS_DELTA", "4.0"))
+
+# Quarter tendency matchup residual (points, shrunk)
+QUARTER_EDGE_CAP = float(os.getenv("QUARTER_EDGE_CAP", "1.5"))
+QUARTER_LOOKBACK_DAYS = int(os.getenv("QUARTER_LOOKBACK_DAYS", "21"))
+# Extra Q4 weight when projected margin is tight
+CLUTCH_MARGIN_THRESHOLD = float(os.getenv("CLUTCH_MARGIN_THRESHOLD", "5.0"))
+CLUTCH_Q4_MULT = float(os.getenv("CLUTCH_Q4_MULT", "1.35"))
+
+# Home/road offensive/defensive split residual
+HOME_ROAD_EDGE_CAP = float(os.getenv("HOME_ROAD_EDGE_CAP", "1.5"))
+
+# Sanity clamps on projected totals / margins (pre-sim means)
+TOTAL_MIN = float(os.getenv("TOTAL_MIN", "190.0"))
+TOTAL_MAX = float(os.getenv("TOTAL_MAX", "260.0"))
+MARGIN_ABS_CAP = float(os.getenv("MARGIN_ABS_CAP", "28.0"))
+
+# Shorter TTL for volatile personnel sources (hours)
+ROSTER_CACHE_MAX_AGE_HOURS = float(os.getenv("ROSTER_CACHE_MAX_AGE_HOURS", "3"))
+INJURY_CACHE_MAX_AGE_HOURS = float(os.getenv("INJURY_CACHE_MAX_AGE_HOURS", "1.5"))
 
 # HTTP
 USER_AGENT = (

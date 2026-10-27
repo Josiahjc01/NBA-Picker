@@ -105,6 +105,15 @@ def format_markdown(
                 f"{pred['home_abbr']} {sims.get('home_pts_p10')}-{sims.get('home_pts_p90')}"
             )
         notes = pred.get("notes") or {}
+        tags = pred.get("form_tags") or []
+        if tags:
+            lines.append("- **Form tags:** " + ", ".join(tags))
+        if notes.get("form"):
+            lines.append("- **Hot/cold:** " + "; ".join(notes["form"]))
+        if notes.get("quarters"):
+            lines.append("- **Quarter edges:** " + "; ".join(notes["quarters"]))
+        if pred.get("clutch_q4"):
+            lines.append("- **Clutch Q4 weighting:** on (projected close)")
         if notes.get("injuries"):
             lines.append("- **Injuries:** " + "; ".join(notes["injuries"]))
         if notes.get("rest_travel"):
@@ -191,7 +200,14 @@ def print_terminal(
               f"P(home)={pred['home_win_prob']:.1%}  margin={pred['margin']:+.1f}  "
               f"[{nsim} sims]")
         notes = pred.get("notes") or {}
+        tags = pred.get("form_tags") or []
+        if tags:
+            safe_print(f"      [form-tag] {ascii_safe(', '.join(tags))}")
+        if pred.get("clutch_q4"):
+            safe_print("      [clutch] Q4 weighting ON")
         for label, key in (
+            ("form", "form"),
+            ("qtr", "quarters"),
             ("inj", "injuries"),
             ("ctx", "rest_travel"),
             ("pt", "play_types"),
