@@ -22,6 +22,7 @@ a = Analysis(
         'data.cache_util',
         'data.static_arenas',
         'model.predict',
+        'model.brief',
         'nba_api',
         'pandas',
         'numpy',

@@ -16,10 +16,12 @@ python main.py
 python main.py --date 2026-10-27
 python main.py --force-refresh
 
-# Desktop UI (stdlib tkinter)
+# Desktop UI (stdlib tkinter) — Away vs Home + Date
 python gui.py
 python main.py --gui
 ```
+
+The GUI asks for **Away**, **Home**, and **Date**, then runs that scheduled matchup and shows an **AI paste** block (win %, avg combined score, top-3 PTS/REB/AST/STL/BLK). If the matchup is not on that day’s schedule, it tells you clearly and does not invent a custom game.
 
 ### Windows `.exe`
 
