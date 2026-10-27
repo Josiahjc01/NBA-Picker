@@ -72,8 +72,8 @@ jobs:
             Prebuilt windowed `NBA-Picker.exe` (PyInstaller, `windows-latest`).
 
             Download `NBA-Picker-windows.zip`, extract, and run `NBA-Picker.exe` on Windows.
-            First launch may need network access for free data sources. Optional odds API keys
-            can be set in a `.env` beside the exe (see `.env.example` in the repo).
+            First launch needs network access for free public data sources (ESPN / stats).
+            Optional knobs can be set in a `.env` beside the exe (see `.env.example`).
           files: NBA-Picker-windows.zip
           fail_on_unmatched_files: true
         env:

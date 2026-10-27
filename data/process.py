@@ -518,6 +518,7 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         "context": context,
         "play_types": raw.get("play_types"),
         "games": raw.get("games") or [],
-        "odds": raw.get("odds") or [],
+        "team_logs": raw.get("team_logs"),
+        "players": raw.get("players"),
         "target_date": target.isoformat(),
     }

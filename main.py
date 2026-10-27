@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NBA Picker — free on-demand game predictor and wager recommender."""
+"""NBA Picker — free on-demand game predictor (local personal use)."""
 
 from __future__ import annotations
 
@@ -13,8 +13,12 @@ from pathlib import Path
 import config
 from data.fetch import fetch_all
 from data.process import build_features
+from model.brief import (
+    enrich_predictions_with_brief,
+    format_ai_paste,
+    format_ai_paste_markdown,
+)
 from model.predict import predict_slate
-from model.wagers import rank_top_wagers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +55,6 @@ def resolve_date(raw: str | None) -> date:
 def format_markdown(
     target: date,
     predictions: list[dict],
-    wagers: list[dict],
     meta: dict,
 ) -> str:
     lines = [
@@ -60,7 +63,7 @@ def format_markdown(
         f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
         "",
         f"Games: **{len(predictions)}** · Injuries cached: {meta.get('injuries_count', '?')} · "
-        f"Impact rows: {meta.get('impact_count', '?')} · Odds events: {meta.get('odds_events', 0)}",
+        f"Impact rows: {meta.get('impact_count', '?')}",
         "",
     ]
     if not predictions:
@@ -99,36 +102,34 @@ def format_markdown(
             lines.append("- **Play-type edges:** " + "; ".join(notes["play_types"]))
         lines.append("")
 
-    lines.append("## Top 5 +EV wagers")
-    lines.append("")
-    if not wagers:
-        lines.append(
-            "_No qualifying wagers (need odds API key, edge ≥ "
-            f"{config.MIN_EDGE_PCT:g}%, and sufficient confidence). "
-            "Pure model projections above still apply._"
-        )
-        lines.append("")
-    else:
-        lines.append(
-            "| Rank | Game | Side | Book | Odds | Model P | Edge | Stake (¼ Kelly) |"
-        )
-        lines.append("| ---: | --- | --- | --- | ---: | ---: | ---: | ---: |")
-        for i, w in enumerate(wagers, 1):
-            lines.append(
-                f"| {i} | {w['game']} | {w['side']} | {w['book']} | {w['odds']:+d} | "
-                f"{w['model_prob']:.1%} | {w['edge_pct']:.1f}% | {w['suggested_stake']:.2f} u |"
-            )
-        lines.append("")
-        lines.append(
-            f"_Stake units assume bankroll={config.BANKROLL_UNITS:g}; "
-            f"capped at {config.MAX_STAKE_PCT:g}u. Not financial advice._"
-        )
-        lines.append("")
-
+    lines.append(format_ai_paste_markdown(target.isoformat(), predictions))
     return "\n".join(lines)
 
 
-def print_terminal(target: date, predictions: list[dict], wagers: list[dict]) -> None:
+def _print_team_season(season: dict) -> None:
+    abbr = season.get("team") or "?"
+    win_pct = season.get("win_pct")
+    avg_total = season.get("avg_total")
+    w, l = season.get("wins"), season.get("losses")
+    win_s = f"{win_pct:.1f}% ({w}-{l})" if win_pct is not None else "n/a"
+    tot_s = f"{avg_total:.1f}" if avg_total is not None else "n/a"
+    print(f"      {abbr}: win {win_s}  avg total {tot_s}")
+    tops = season.get("top_players") or {}
+    for stat, title in (
+        ("PTS", "PTS"),
+        ("REB", "REB"),
+        ("AST", "AST"),
+        ("STL", "STL"),
+        ("BLK", "BLK"),
+    ):
+        leaders = tops.get(stat) or []
+        if not leaders:
+            continue
+        joined = ", ".join(f"{x['player']} {x['value']}" for x in leaders)
+        print(f"        {title}: {joined}")
+
+
+def print_terminal(target: date, predictions: list[dict], ai_paste: str | None = None) -> None:
     print()
     print("=" * 64)
     print(f" NBA PICKER  ·  {target.isoformat()}")
@@ -155,37 +156,44 @@ def print_terminal(target: date, predictions: list[dict], wagers: list[dict]) ->
             if vals:
                 joined = ", ".join(vals) if isinstance(vals[0], str) else str(vals)
                 print(f"      [{label}] {joined}")
+        season = pred.get("season") or {}
+        for side in ("away", "home"):
+            if season.get(side):
+                _print_team_season(season[side])
 
+    if ai_paste:
+        print()
+        print("-" * 64)
+        print(" AI PASTE (also written to output/ai_paste_*.txt)")
+        print("-" * 64)
+        # Keep terminal short — point at file; still show first game header
+        print("  Copy the AI paste file into another AI for wager ideas.")
     print()
-    print("-" * 64)
-    print(" TOP +EV WAGERS")
-    print("-" * 64)
-    if not wagers:
-        print("  (none — set ODDS_API_KEY or THERUNDOWN_API_KEY for book lines)")
-    else:
-        for i, w in enumerate(wagers, 1):
-            print(
-                f"  {i}. {w['game']:12}  {w['side']:22}  {w['book']:12}  "
-                f"{w['odds']:+5d}  edge {w['edge_pct']:5.1f}%  stake {w['suggested_stake']:.2f}u"
-            )
-    print()
 
 
-def save_outputs(target: date, payload: dict, md: str) -> tuple[Path, Path]:
+def save_outputs(
+    target: date,
+    payload: dict,
+    md: str,
+    ai_paste: str,
+) -> tuple[Path, Path, Path]:
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     dated_md = config.OUTPUT_DIR / f"predictions_{target.isoformat()}.md"
     dated_json = config.OUTPUT_DIR / f"predictions_{target.isoformat()}.json"
+    dated_ai = config.OUTPUT_DIR / f"ai_paste_{target.isoformat()}.txt"
     dated_md.write_text(md)
     dated_json.write_text(json.dumps(payload, indent=2, default=str))
-    # Alias "today_*" only when targeting today (UTC)
+    dated_ai.write_text(ai_paste)
     today = datetime.now(timezone.utc).date()
     if target == today:
         md_path = config.OUTPUT_DIR / "today_predictions.md"
         json_path = config.OUTPUT_DIR / "today_predictions.json"
+        ai_path = config.OUTPUT_DIR / "today_ai_paste.txt"
         md_path.write_text(md)
         json_path.write_text(json.dumps(payload, indent=2, default=str))
-        return md_path, json_path
-    return dated_md, dated_json
+        ai_path.write_text(ai_paste)
+        return md_path, json_path, ai_path
+    return dated_md, dated_json, dated_ai
 
 
 def run_pipeline(
@@ -193,22 +201,35 @@ def run_pipeline(
     force: bool = False,
     *,
     team_filter: set[str] | None = None,
+    matchup: tuple[str, str] | None = None,
     write_outputs: bool = True,
 ) -> dict:
     """
     Core pipeline used by CLI and GUI.
 
-    Returns payload dict with keys: date, generated_at, meta, predictions, wagers,
-    markdown, md_path, json_path.
+    Returns payload with predictions (incl. season/top players), ai_paste,
+    markdown, and output paths.
+
+    ``matchup`` is ``(away_abbr, home_abbr)`` and takes precedence over
+    ``team_filter`` when set.
     """
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     raw = fetch_all(target, force=force)
     features = build_features(raw, target)
-    predictions = predict_slate(features)
+    predictions = enrich_predictions_with_brief(predict_slate(features), features)
 
-    if team_filter:
+    if matchup:
+        away_m = matchup[0].upper()
+        home_m = matchup[1].upper()
+        predictions = [
+            p
+            for p in predictions
+            if p.get("away_abbr", "").upper() == away_m
+            and p.get("home_abbr", "").upper() == home_m
+        ]
+    elif team_filter:
         wanted = {t.upper() for t in team_filter}
         predictions = [
             p
@@ -217,34 +238,36 @@ def run_pipeline(
             or p.get("away_abbr", "").upper() in wanted
         ]
 
-    wagers = rank_top_wagers(predictions, features.get("odds") or [])
     meta = raw.get("meta") or {}
+    ai_paste = format_ai_paste(target.isoformat(), predictions)
     payload = {
         "date": target.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "meta": meta,
         "predictions": predictions,
-        "wagers": wagers,
+        "ai_paste": ai_paste,
     }
-    md = format_markdown(target, predictions, wagers, meta)
+    md = format_markdown(target, predictions, meta)
     payload["markdown"] = md
-    md_path = json_path = None
+    md_path = json_path = ai_path = None
     if write_outputs:
-        md_path, json_path = save_outputs(target, payload, md)
+        md_path, json_path, ai_path = save_outputs(target, payload, md, ai_paste)
     payload["md_path"] = str(md_path) if md_path else None
     payload["json_path"] = str(json_path) if json_path else None
+    payload["ai_paste_path"] = str(ai_path) if ai_path else None
     return payload
 
 
 def run(target: date, force: bool = False) -> int:
     payload = run_pipeline(target, force=force)
     predictions = payload["predictions"]
-    wagers = payload["wagers"]
-    print_terminal(target, predictions, wagers)
+    print_terminal(target, predictions, payload.get("ai_paste"))
     if payload.get("md_path"):
         print(f"Wrote {payload['md_path']}")
     if payload.get("json_path"):
         print(f"Wrote {payload['json_path']}")
+    if payload.get("ai_paste_path"):
+        print(f"Wrote {payload['ai_paste_path']}  ← paste this into an AI for wager ideas")
     return 0
 
 

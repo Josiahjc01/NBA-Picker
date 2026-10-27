@@ -251,15 +251,25 @@ def player_stats(limit_pages: int = 7) -> list[dict[str, Any]]:
                             values[names[i]] = float(val)
                         except (TypeError, ValueError):
                             continue
+            def _first(*keys: str) -> float | None:
+                for k in keys:
+                    if values.get(k) is not None:
+                        return values.get(k)
+                return None
+
             rows.append(
                 {
                     "PLAYER_NAME": name,
                     "TEAM_ABBREVIATION": team_abbr,
-                    "MIN": values.get("avgMinutes") or 0.0,
-                    "PTS": values.get("avgPoints"),
-                    "PLUS_MINUS": values.get("avgPlusMinus") or values.get("plusMinus"),
-                    "NBA_FANTASY_PTS": values.get("avgPoints"),
-                    "GP": values.get("gamesPlayed"),
+                    "MIN": _first("avgMinutes") or 0.0,
+                    "PTS": _first("avgPoints"),
+                    "REB": _first("avgRebounds", "avgTotalRebounds", "avgDefensiveRebounds"),
+                    "AST": _first("avgAssists"),
+                    "STL": _first("avgSteals"),
+                    "BLK": _first("avgBlocks"),
+                    "PLUS_MINUS": _first("avgPlusMinus", "plusMinus"),
+                    "NBA_FANTASY_PTS": _first("avgPoints"),
+                    "GP": _first("gamesPlayed"),
                     "SOURCE": "espn_athletes",
                 }
             )

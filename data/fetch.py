@@ -696,119 +696,6 @@ def fetch_player_impact(force: bool = False) -> list[dict[str, Any]]:
         return []
 
 
-# ---------------------------------------------------------------------------
-# Odds — The Odds API / TheRundown
-# ---------------------------------------------------------------------------
-
-def _american_to_implied(odds: float) -> float:
-    if odds is None:
-        return 0.0
-    o = float(odds)
-    if o > 0:
-        return 100.0 / (o + 100.0)
-    return abs(o) / (abs(o) + 100.0)
-
-
-def _fetch_odds_api() -> list[dict[str, Any]]:
-    if not config.ODDS_API_KEY:
-        raise RuntimeError("ODDS_API_KEY not set")
-    url = f"{config.ODDS_API_BASE}/sports/basketball_nba/odds"
-    params = {
-        "apiKey": config.ODDS_API_KEY,
-        "regions": "us",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "american",
-    }
-    resp = _get(url, params=params)
-    events = resp.json()
-    out: list[dict[str, Any]] = []
-    for ev in events:
-        game = {
-            "id": ev.get("id"),
-            "commence_time": ev.get("commence_time"),
-            "home_team": ev.get("home_team"),
-            "away_team": ev.get("away_team"),
-            "bookmakers": [],
-        }
-        for book in ev.get("bookmakers", []):
-            bm = {"key": book.get("key"), "title": book.get("title"), "markets": []}
-            for market in book.get("markets", []):
-                bm["markets"].append(
-                    {
-                        "key": market.get("key"),
-                        "outcomes": market.get("outcomes", []),
-                    }
-                )
-            game["bookmakers"].append(bm)
-        out.append(game)
-    return out
-
-
-def _fetch_therundown() -> list[dict[str, Any]]:
-    if not config.THERUNDOWN_API_KEY:
-        raise RuntimeError("THERUNDOWN_API_KEY not set")
-    # RapidAPI TheRundown free tier style
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    url = f"{config.THERUNDOWN_BASE}/sports/4/events/{today}"
-    headers = {
-        "X-RapidAPI-Key": config.THERUNDOWN_API_KEY,
-        "X-RapidAPI-Host": "therundown-therundown-v1.p.rapidapi.com",
-        "User-Agent": config.USER_AGENT,
-    }
-    resp = SESSION.get(url, headers=headers, timeout=config.REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    events = data.get("events") or data.get("data") or []
-    out: list[dict[str, Any]] = []
-    for ev in events:
-        teams = ev.get("teams") or []
-        home = next((t for t in teams if t.get("is_home")), teams[0] if teams else {})
-        away = next(
-            (t for t in teams if not t.get("is_home")),
-            teams[1] if len(teams) > 1 else {},
-        )
-        lines = []
-        for line in ev.get("lines", {}).values() if isinstance(ev.get("lines"), dict) else []:
-            lines.append(line)
-        out.append(
-            {
-                "id": str(ev.get("event_id") or ev.get("id")),
-                "commence_time": ev.get("event_date") or ev.get("date_event"),
-                "home_team": home.get("name") or home.get("team_name"),
-                "away_team": away.get("name") or away.get("team_name"),
-                "bookmakers": [{"key": "therundown", "title": "TheRundown", "markets": [], "raw_lines": lines}],
-                "source": "therundown",
-            }
-        )
-    return out
-
-
-def fetch_odds(force: bool = False) -> list[dict[str, Any]]:
-    key = "odds"
-
-    def _fetch():
-        errors = []
-        if config.ODDS_API_KEY:
-            try:
-                return _fetch_odds_api()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"odds_api: {exc}")
-        if config.THERUNDOWN_API_KEY:
-            try:
-                return _fetch_therundown()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"therundown: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        raise RuntimeError("No odds API key configured")
-
-    try:
-        return load_or_fetch_json(key, _fetch, force=force) or []
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Odds unavailable — projections only (%s)", exc)
-        return []
-
-
 def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     """Orchestrate all free-source pulls for a target slate."""
     logger.info("Fetching data for %s (force=%s)", target_date, force)
@@ -821,7 +708,6 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     play_types = fetch_play_types(force=force)
     injuries = fetch_injuries(force=force)
     impact = fetch_player_impact(force=force)
-    odds = fetch_odds(force=force)
 
     bundle = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -830,7 +716,6 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "team_logs_rows": len(team_logs),
         "injuries_count": len(injuries),
         "impact_count": len(impact),
-        "odds_events": len(odds),
     }
     write_json_cache(config.CACHE_DIR / f"bundle_meta_{target_date.isoformat()}.json", bundle)
 
@@ -844,7 +729,6 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "play_types": play_types,
         "injuries": injuries,
         "impact": impact,
-        "odds": odds,
         "meta": bundle,
     }
 

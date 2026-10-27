@@ -22,7 +22,7 @@ a = Analysis(
         'data.cache_util',
         'data.static_arenas',
         'model.predict',
-        'model.wagers',
+        'model.brief',
         'nba_api',
         'pandas',
         'numpy',

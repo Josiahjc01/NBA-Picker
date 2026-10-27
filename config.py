@@ -23,21 +23,9 @@ CACHE_MAX_AGE_HOURS = float(os.getenv("CACHE_MAX_AGE_HOURS", "6"))
 EWM_SPAN = int(os.getenv("EWM_SPAN", "15"))
 PRIOR_BLEND_GAMES = int(os.getenv("PRIOR_BLEND_GAMES", "10"))
 
-# Wager filters
-MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "3.0"))
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
-MAX_STAKE_PCT = float(os.getenv("MAX_STAKE_PCT", "5.0"))  # of bankroll unit=100
-BANKROLL_UNITS = float(os.getenv("BANKROLL_UNITS", "100"))
-
-# Odds providers (free tiers)
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-THERUNDOWN_API_KEY = os.getenv("THERUNDOWN_API_KEY", "").strip()
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-THERUNDOWN_BASE = "https://therundown-therundown-v1.p.rapidapi.com"
-
 # HTTP
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; NBA-Picker/1.0; +https://github.com/NBA-Picker)"
+    "Mozilla/5.0 (compatible; NBA-Picker/1.0; local)"
 )
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 # nba_api / stats.nba.com is often blocked from cloud IPs — keep attempts short

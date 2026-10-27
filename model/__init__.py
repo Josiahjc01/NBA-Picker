@@ -1,1 +1,1 @@
-"""Prediction and wager recommendation package."""
+"""Prediction package."""
