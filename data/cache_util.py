@@ -36,9 +36,10 @@ def cache_fresh(path: Path, max_age_hours: float | None = None) -> bool:
 
 def write_json_cache(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, default=str))
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     _meta_path(path).write_text(
-        json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat()})
+        json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
     )
 
 
@@ -46,7 +47,7 @@ def read_json_cache(path: Path) -> Any | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed reading cache %s: %s", path, exc)
         return None

@@ -19,6 +19,7 @@ from model.brief import (
     format_ai_paste_markdown,
 )
 from model.predict import predict_slate
+from safe_text import ascii_safe, safe_print, write_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,15 +146,15 @@ def _print_personnel(personnel: dict | None) -> None:
         print(f"  {s.get('team')}: roster {s.get('roster_size')}")
         for p in (s.get("key_players") or [])[:5]:
             flag = f"  [{p['injury']}]" if p.get("injury") else ""
-            print(
-                f"    {p['player']:22}  {p['proj_min']:5.1f} → {p['adj_min']:5.1f} min{flag}"
+            safe_print(
+                f"    {p['player']:22}  {p['proj_min']:5.1f} -> {p['adj_min']:5.1f} min{flag}"
             )
         for p in (s.get("injury_flags") or [])[:4]:
             if p.get("player") in {k["player"] for k in (s.get("key_players") or [])[:5]}:
                 continue
-            print(
+            safe_print(
                 f"    ! {p['player']:20}  {p.get('status')}  "
-                f"{p['proj_min']:.0f}→{p['adj_min']:.0f}"
+                f"{p['proj_min']:.0f}->{p['adj_min']:.0f}"
             )
 
 
@@ -188,7 +189,7 @@ def print_terminal(
             vals = notes.get(key) or []
             if vals:
                 joined = ", ".join(vals) if isinstance(vals[0], str) else str(vals)
-                print(f"      [{label}] {joined}")
+                safe_print(f"      [{label}] {ascii_safe(joined)}")
         season = pred.get("season") or {}
         for side in ("away", "home"):
             if season.get(side):
@@ -214,17 +215,17 @@ def save_outputs(
     dated_md = config.OUTPUT_DIR / f"predictions_{target.isoformat()}.md"
     dated_json = config.OUTPUT_DIR / f"predictions_{target.isoformat()}.json"
     dated_ai = config.OUTPUT_DIR / f"ai_paste_{target.isoformat()}.txt"
-    dated_md.write_text(md)
-    dated_json.write_text(json.dumps(payload, indent=2, default=str))
-    dated_ai.write_text(ai_paste)
+    write_text(dated_md, md)
+    write_text(dated_json, json.dumps(payload, indent=2, default=str))
+    write_text(dated_ai, ai_paste)
     today = datetime.now(timezone.utc).date()
     if target == today:
         md_path = config.OUTPUT_DIR / "today_predictions.md"
         json_path = config.OUTPUT_DIR / "today_predictions.json"
         ai_path = config.OUTPUT_DIR / "today_ai_paste.txt"
-        md_path.write_text(md)
-        json_path.write_text(json.dumps(payload, indent=2, default=str))
-        ai_path.write_text(ai_paste)
+        write_text(md_path, md)
+        write_text(json_path, json.dumps(payload, indent=2, default=str))
+        write_text(ai_path, ai_paste)
         return md_path, json_path, ai_path
     return dated_md, dated_json, dated_ai
 
@@ -315,7 +316,7 @@ def run(
     if payload.get("json_path"):
         print(f"Wrote {payload['json_path']}")
     if payload.get("ai_paste_path"):
-        print(f"Wrote {payload['ai_paste_path']}  ← paste this into an AI for wager ideas")
+        print(f"Wrote {payload['ai_paste_path']}  <- paste this into an AI for wager ideas")
     return 0
 
 

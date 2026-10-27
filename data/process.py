@@ -493,14 +493,23 @@ def team_impact_from_players(
                 lost = epm * ((base_mins - mins) / 48.0)
                 team_notes.append(
                     f"{r['player']} ({r.get('injury_status') or 'injured'}): "
-                    f"{base_mins:.0f}→{mins:.0f} min, Δ{lost:+.2f} EPM-w"
+                    f"{base_mins:.0f}->{mins:.0f} min, d{lost:+.2f} EPM-w"
                 )
         out[team] = {
             "player_impact": total,
             "healthy_impact": healthy,
             "injury_delta": total - healthy,
         }
-        notes[team] = sorted(team_notes, key=lambda s: abs(float(s.split("Δ")[-1].replace(" EPM-w", ""))), reverse=True)[:4]
+
+        def _note_mag(s: str) -> float:
+            # Parse trailing "d+1.23 EPM-w" (ASCII; was Greek Delta before)
+            try:
+                token = s.rsplit("d", 1)[-1].replace(" EPM-w", "").strip()
+                return abs(float(token))
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        notes[team] = sorted(team_notes, key=_note_mag, reverse=True)[:4]
         out[team]["injury_notes"] = notes[team]  # type: ignore[assignment]
     return out
 
@@ -744,7 +753,7 @@ def verify_matchup_personnel(
             s["team"],
             s["roster_size"],
             ", ".join(
-                f"{p['player']} {p['proj_min']}→{p['adj_min']}m"
+                f"{p['player']} {p['proj_min']}->{p['adj_min']}m"
                 + (f" [{p['injury']}]" if p["injury"] else "")
                 for p in s["key_players"][:5]
             ),
@@ -754,7 +763,7 @@ def verify_matchup_personnel(
                 "VERIFY %s injuries: %s",
                 s["team"],
                 "; ".join(
-                    f"{p['player']}={p['status']} ({p['proj_min']}→{p['adj_min']})"
+                    f"{p['player']}={p['status']} ({p['proj_min']}->{p['adj_min']})"
                     for p in s["injury_flags"][:5]
                 ),
             )
