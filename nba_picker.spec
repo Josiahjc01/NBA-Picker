@@ -23,6 +23,7 @@ a = Analysis(
         'data.static_arenas',
         'model.predict',
         'model.brief',
+        'safe_text',
         'nba_api',
         'pandas',
         'numpy',

@@ -111,9 +111,9 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
     injury_notes = list(hi.get("injury_notes") or []) + list(ai.get("injury_notes") or [])
     # Biggest injury deltas
     if hi.get("injury_delta"):
-        injury_notes.insert(0, f"{home} injury Δ impact {hi['injury_delta']:+.2f}")
+        injury_notes.insert(0, f"{home} injury dNet {hi['injury_delta']:+.2f}")
     if ai.get("injury_delta"):
-        injury_notes.insert(0, f"{away} injury Δ impact {ai['injury_delta']:+.2f}")
+        injury_notes.insert(0, f"{away} injury dNet {ai['injury_delta']:+.2f}")
 
     margin = home_pts - away_pts
     win_p = margin_to_win_prob(margin)

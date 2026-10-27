@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from data.fetch import fetch_games_for_date  # noqa: E402
 from data.static_arenas import ARENAS, normalize_abbrev  # noqa: E402
 from main import format_markdown, resolve_date, run_pipeline  # noqa: E402
+from safe_text import ascii_safe  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -217,7 +218,8 @@ class NbaPickerApp(tk.Tk):
     def _write_results(self, text: str) -> None:
         self.results.configure(state=tk.NORMAL)
         self.results.delete("1.0", tk.END)
-        self.results.insert(tk.END, text)
+        # Tk Text is unicode-capable; still sanitize so status/clipboard paths stay safe
+        self.results.insert(tk.END, ascii_safe(text))
         self.results.see("1.0")
 
     def on_run(self) -> None:
@@ -273,16 +275,17 @@ class NbaPickerApp(tk.Tk):
             def done() -> None:
                 self._set_busy(False)
                 if err:
-                    self.status_var.set(f"Run failed: {err}")
-                    messagebox.showerror("Run", str(err))
+                    msg = ascii_safe(err)
+                    self.status_var.set(f"Run failed: {msg}")
+                    messagebox.showerror("Run", msg)
                     return
                 if not_scheduled_msg:
                     self.hint_var.set(
                         f"{away} @ {home} is not scheduled on {target.isoformat()}."
                     )
-                    self._write_results(not_scheduled_msg)
+                    self._write_results(ascii_safe(not_scheduled_msg))
                     self.status_var.set("Not on schedule for that date.")
-                    messagebox.showwarning("Not scheduled", not_scheduled_msg)
+                    messagebox.showwarning("Not scheduled", ascii_safe(not_scheduled_msg))
                     return
                 assert payload is not None
                 preds = payload.get("predictions") or []
