@@ -458,6 +458,18 @@ def recent_quarter_game_rows(days_back: int = 21) -> list[dict[str, Any]]:
     return rows
 
 
+def _parse_made_attempted(raw: Any) -> tuple[float | None, float | None]:
+    """Parse ESPN '10-20' style made-attempted strings."""
+    s = str(raw or "").strip()
+    if "-" not in s:
+        return None, None
+    left, right = s.split("-", 1)
+    try:
+        return float(left), float(right)
+    except (TypeError, ValueError):
+        return None, None
+
+
 def player_gamelog_recent(
     athlete_id: str,
     *,
@@ -467,6 +479,7 @@ def player_gamelog_recent(
     """
     Recent per-game counting stats for one ESPN athlete id.
     season_end_year: ending calendar year of the NBA season (2026-27 -> 2027).
+    Includes minutes, points, FGA (usage proxy), AST when present.
     """
     if not athlete_id:
         return []
@@ -483,14 +496,19 @@ def player_gamelog_recent(
         return []
 
     names = list(data.get("names") or [])
-    try:
-        pts_i = names.index("points")
-    except ValueError:
+
+    def _idx(*keys: str) -> int:
+        for k in keys:
+            if k in names:
+                return names.index(k)
+        return -1
+
+    pts_i = _idx("points")
+    min_i = _idx("minutes")
+    fg_i = _idx("fieldGoalsMade-fieldGoalsAttempted")
+    ast_i = _idx("assists")
+    if pts_i < 0:
         pts_i = len(names) - 1 if names else -1
-    try:
-        min_i = names.index("minutes")
-    except ValueError:
-        min_i = 0 if names else -1
 
     events_meta = data.get("events") or {}
     dated: list[tuple[str, dict[str, Any]]] = []
@@ -513,6 +531,15 @@ def player_gamelog_recent(
                         mins = float(stats[min_i])
                     except (TypeError, ValueError):
                         mins = None
+                fga = None
+                if 0 <= fg_i < len(stats):
+                    _, fga = _parse_made_attempted(stats[fg_i])
+                ast = None
+                if 0 <= ast_i < len(stats):
+                    try:
+                        ast = float(stats[ast_i])
+                    except (TypeError, ValueError):
+                        ast = None
                 dated.append(
                     (
                         gdate,
@@ -520,6 +547,8 @@ def player_gamelog_recent(
                             "game_date": gdate,
                             "pts": pts,
                             "minutes": mins,
+                            "fga": fga,
+                            "ast": ast,
                             "event_id": eid,
                             "result": meta.get("gameResult"),
                         },
@@ -527,6 +556,96 @@ def player_gamelog_recent(
                 )
     dated.sort(key=lambda x: x[0], reverse=True)
     return [row for _, row in dated[: max(1, last_n)]]
+
+
+def game_day_injuries(event_id: str) -> list[dict[str, Any]]:
+    """Per-game injury/inactive list from ESPN summary (day-of when posted)."""
+    if not event_id:
+        return []
+    try:
+        data = _get(f"{SITE}/summary", params={"event": str(event_id)})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ESPN summary injuries %s failed: %s", event_id, exc)
+        return []
+    out: list[dict[str, Any]] = []
+    for group in data.get("injuries") or []:
+        team = group.get("team") or {}
+        team_abbr = normalize_abbrev(team.get("abbreviation"))
+        team_name = team.get("displayName") or ""
+        for inj in group.get("injuries") or []:
+            athlete = inj.get("athlete") or {}
+            player = athlete.get("displayName") or (
+                f"{athlete.get('firstName', '')} {athlete.get('lastName', '')}".strip()
+            )
+            if not player:
+                continue
+            status = str(inj.get("status") or "").strip()
+            typ = inj.get("type") or {}
+            if not status and isinstance(typ, dict):
+                status = str(typ.get("description") or typ.get("name") or "").strip()
+            out.append(
+                {
+                    "team": team_name,
+                    "team_abbr": team_abbr,
+                    "player": player,
+                    "status": status,
+                    "comment": str(inj.get("shortComment") or inj.get("longComment") or ""),
+                    "game_id": str(event_id),
+                    "source": "espn_summary_gameday",
+                }
+            )
+    return out
+
+
+def team_season_stats_for_year(season_end_year: int) -> list[dict[str, Any]]:
+    """ESPN team season averages for a given ending calendar year (2026 = 2025-26)."""
+    teams = list_teams()
+    rows = []
+    for t in teams:
+        try:
+            data = _get(
+                f"{SITE}/teams/{t['id']}/statistics",
+                params={"season": int(season_end_year), "seasontype": 2},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ESPN prior stats %s/%s failed: %s", t["abbr"], season_end_year, exc)
+            continue
+        cats = (((data.get("results") or {}).get("stats") or {}).get("categories")) or []
+        flat: dict[str, float] = {}
+        for cat in cats:
+            for s in cat.get("stats") or []:
+                name = s.get("name")
+                val = s.get("value")
+                if name is None or val is None:
+                    continue
+                try:
+                    flat[name] = float(val)
+                except (TypeError, ValueError):
+                    continue
+        pts = flat.get("avgPoints")
+        opp = flat.get("avgPointsAllowed") or flat.get("avgOpponentPoints")
+        rows.append(
+            {
+                "TEAM_ABBREVIATION": t["abbr"],
+                "TEAM_NAME": t["name"],
+                "GP": flat.get("gamesPlayed"),
+                "PTS": pts,
+                "OPP_PTS": opp,
+                "FG_PCT": flat.get("fieldGoalPct") or flat.get("avgFieldGoalPct"),
+                "FG3_PCT": flat.get("threePointPct"),
+                "FT_PCT": flat.get("freeThrowPct"),
+                "AVG_FGA": flat.get("avgFieldGoalsAttempted"),
+                "AVG_FGM": flat.get("avgFieldGoalsMade"),
+                "AVG_FG3M": flat.get("avgThreePointFieldGoalsMade"),
+                "AVG_FG3A": flat.get("avgThreePointFieldGoalsAttempted"),
+                "AVG_FTA": flat.get("avgFreeThrowsAttempted"),
+                "AVG_FTM": flat.get("avgFreeThrowsMade"),
+                "AVG_OREB": flat.get("avgOffensiveRebounds"),
+                "AVG_TOV": flat.get("avgTurnovers"),
+                "SOURCE": f"espn_season_{season_end_year}",
+            }
+        )
+    return rows
 
 
 def enrich_ratings_from_season_stats(season_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

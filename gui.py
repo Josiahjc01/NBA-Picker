@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config  # noqa: E402
 from data.fetch import fetch_games_for_date  # noqa: E402
 from data.static_arenas import ARENAS, normalize_abbrev  # noqa: E402
 from main import format_markdown, resolve_date, run_pipeline  # noqa: E402
@@ -143,6 +144,21 @@ class NbaPickerApp(tk.Tk):
         self.date_entry = ttk.Entry(row2, textvariable=self.date_var, width=14)
         self.date_entry.pack(side=tk.LEFT, padx=(6, 16))
 
+        ttk.Label(row2, text="Sims").pack(side=tk.LEFT)
+        sim_labels = [f"{n:,}" for n in config.SIM_COUNT_CHOICES]
+        default_sim = f"{int(config.SIM_COUNT):,}"
+        if default_sim not in sim_labels:
+            default_sim = "10,000"
+        self.sims_var = tk.StringVar(value=default_sim)
+        self.sims_box = ttk.Combobox(
+            row2,
+            textvariable=self.sims_var,
+            values=sim_labels,
+            width=8,
+            state="readonly",
+        )
+        self.sims_box.pack(side=tk.LEFT, padx=(6, 16))
+
         self.force_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="Force refresh", variable=self.force_var).pack(
             side=tk.LEFT, padx=(0, 16)
@@ -152,7 +168,7 @@ class NbaPickerApp(tk.Tk):
         self.run_btn.pack(side=tk.LEFT, padx=2)
 
         self.hint_var = tk.StringVar(
-            value="Pick Away, Home, and Date — then Run. Only scheduled games that day."
+            value="Pick Away, Home, Date, and Sims — then Run. Only scheduled games that day."
         )
         ttk.Label(form, textvariable=self.hint_var, wraplength=820).pack(
             anchor=tk.W, pady=(8, 0)
@@ -205,6 +221,16 @@ class NbaPickerApp(tk.Tk):
             return None
         return away, home
 
+    def _selected_sims(self) -> int:
+        raw = (self.sims_var.get() or "").replace(",", "").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = int(config.SIM_COUNT)
+        if n not in config.SIM_COUNT_CHOICES:
+            n = int(config.SIM_COUNT)
+        return n
+
     def _set_busy(self, busy: bool, msg: str | None = None) -> None:
         self._busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
@@ -212,6 +238,7 @@ class NbaPickerApp(tk.Tk):
         self.away_box.configure(state=state if busy else "normal")
         self.home_box.configure(state=state if busy else "normal")
         self.date_entry.configure(state=state)
+        self.sims_box.configure(state=tk.DISABLED if busy else "readonly")
         if msg:
             self.status_var.set(msg)
 
@@ -232,9 +259,11 @@ class NbaPickerApp(tk.Tk):
         if not matchup:
             return
         away, home = matchup
+        sim_count = self._selected_sims()
         self._set_busy(
             True,
-            f"Checking schedule for {away} @ {home} on {target.isoformat()}…",
+            f"Checking schedule for {away} @ {home} on {target.isoformat()} "
+            f"({sim_count:,} sims)…",
         )
 
         def work() -> None:
@@ -267,6 +296,7 @@ class NbaPickerApp(tk.Tk):
                         force=self.force_var.get(),
                         matchup=(away, home),
                         write_outputs=True,
+                        sim_count=sim_count,
                     )
             except Exception as exc:  # noqa: BLE001
                 err = exc
