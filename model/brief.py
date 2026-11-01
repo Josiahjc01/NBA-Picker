@@ -13,13 +13,29 @@ from data.static_arenas import normalize_abbrev
 
 logger = logging.getLogger(__name__)
 
-STAT_KEYS = ("PTS", "REB", "AST", "STL", "BLK")
+STAT_KEYS = ("PTS", "REB", "AST", "STL", "BLK", "FG3M")
+# Highlights shown in the main Results UI (away + home leader each)
+HIGHLIGHT_STATS = ("PTS", "REB", "AST", "FG3M")
+HIGHLIGHT_TITLES: dict[str, str] = {
+    "PTS": "Points",
+    "REB": "Rebounds",
+    "AST": "Assists",
+    "FG3M": "3PM",
+}
 STAT_ALIASES: dict[str, tuple[str, ...]] = {
     "PTS": ("PTS", "pts", "avgPoints"),
     "REB": ("REB", "reb", "TREB", "avgRebounds", "REB_TOTAL"),
     "AST": ("AST", "ast", "avgAssists"),
     "STL": ("STL", "stl", "avgSteals"),
     "BLK": ("BLK", "blk", "avgBlocks"),
+    "FG3M": (
+        "FG3M",
+        "fg3m",
+        "AVG_FG3M",
+        "avgThreePointFieldGoalsMade",
+        "threePointFieldGoalsMade",
+        "FG3",
+    ),
 }
 # Exclude inactive / DNP from projected leaders
 MIN_ADJ_MINUTES_FOR_LEADERS = 1.0
@@ -287,8 +303,33 @@ def enrich_predictions_with_brief(
             season["leaders_basis"] = "projected_this_game"
             sides[side] = season
         p["season"] = sides
+        p["highlights"] = matchup_highlights(p)
         enriched.append(p)
     return enriched
+
+
+def matchup_highlights(pred: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Away + home projected leaders for PTS / REB / AST / 3PM (sim this-game).
+    Used by the Results Highlights section (outside the AI paste block).
+    """
+    season = pred.get("season") or {}
+    out: list[dict[str, Any]] = []
+    for stat in HIGHLIGHT_STATS:
+        title = HIGHLIGHT_TITLES.get(stat, stat)
+        row: dict[str, Any] = {"stat": stat, "title": title, "away": None, "home": None}
+        for side in ("away", "home"):
+            tops = ((season.get(side) or {}).get("top_players") or {}).get(stat) or []
+            if tops:
+                lead = tops[0]
+                row[side] = {
+                    "player": lead.get("player"),
+                    "value": lead.get("value"),
+                    "team": (season.get(side) or {}).get("team") or pred.get(f"{side}_abbr"),
+                    "adj_minutes": lead.get("adj_minutes"),
+                }
+        out.append(row)
+    return out
 
 
 def _fmt_leaders(leaders: list[dict[str, Any]]) -> str:
@@ -324,6 +365,7 @@ def _team_block(label: str, season: dict[str, Any]) -> list[str]:
         ("PTS", "Points"),
         ("REB", "Rebounds"),
         ("AST", "Assists"),
+        ("FG3M", "3PM"),
         ("STL", "Steals"),
         ("BLK", "Blocks"),
     ):
@@ -433,7 +475,7 @@ def format_ai_paste_markdown(target_date: str, predictions: list[dict[str, Any]]
         "",
         "_Copy everything under this heading into another AI for wager ideas. "
         "Includes season win rate / avg combined score (context) and top-3 "
-        "players by **projected this game** PTS / REB / AST / STL / BLK "
+        "players by **projected this game** PTS / REB / AST / 3PM / STL / BLK "
         "(sim mean — not season per-game)._",
         "",
         f"Slate date: **{target_date}**",

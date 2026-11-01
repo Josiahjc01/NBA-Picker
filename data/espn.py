@@ -340,6 +340,10 @@ def player_stats(limit_pages: int = 12) -> list[dict[str, Any]]:
                     "AST": _first("avgAssists"),
                     "STL": _first("avgSteals"),
                     "BLK": _first("avgBlocks"),
+                    "FG3M": _first(
+                        "avgThreePointFieldGoalsMade",
+                        "threePointFieldGoalsMade",
+                    ),
                     "PLUS_MINUS": _first("avgPlusMinus", "plusMinus"),
                     "NBA_FANTASY_PTS": _first("avgPoints"),
                     "GP": _first("gamesPlayed"),

@@ -21,6 +21,7 @@ import config  # noqa: E402
 from data.fetch import fetch_games_for_date  # noqa: E402
 from data.static_arenas import ARENAS, normalize_abbrev  # noqa: E402
 from main import format_markdown, resolve_date, run_pipeline  # noqa: E402
+from model.brief import HIGHLIGHT_TITLES  # noqa: E402
 from safe_text import ascii_safe  # noqa: E402
 
 logging.basicConfig(
@@ -92,26 +93,50 @@ def _abbr_from_choice(raw: str) -> str:
     return normalize_abbrev(text)
 
 
+def _bind_typeahead(box: ttk.Combobox, all_choices: list[str]) -> None:
+    """Filter combobox values as the user types (case-insensitive substring)."""
+
+    def _filter(_event: tk.Event | None = None) -> None:
+        typed = (box.get() or "").strip()
+        if not typed:
+            box.configure(values=all_choices)
+            return
+        low = typed.lower()
+        filtered = [c for c in all_choices if low in c.lower()]
+        # Keep current typed text; only shrink the dropdown list
+        box.configure(values=filtered if filtered else all_choices)
+
+    def _reset_list(_event: tk.Event | None = None) -> None:
+        # After a selection, restore full list for next open
+        box.configure(values=all_choices)
+
+    box.bind("<KeyRelease>", _filter)
+    box.bind("<<ComboboxSelected>>", _reset_list)
+    box.bind("<FocusOut>", _reset_list)
+
+
 class NbaPickerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("NBA Picker")
-        self.geometry("900x640")
-        self.minsize(700, 480)
+        self.geometry("920x700")
+        self.minsize(720, 520)
 
         self._busy = False
         self._last_md: str = ""
         self._last_md_path: str | None = None
         self._last_ai: str = ""
         self._last_ai_path: str | None = None
+        self._last_payload: dict[str, Any] | None = None
         self._schedule_hint: str = ""
+        self._team_choices = _team_choices()
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def _build(self) -> None:
         pad = {"padx": 10, "pady": 6}
-        choices = _team_choices()
+        choices = self._team_choices
 
         form = ttk.LabelFrame(self, text="Matchup", padding=10)
         form.pack(fill=tk.X, **pad)
@@ -125,6 +150,7 @@ class NbaPickerApp(tk.Tk):
             row1, textvariable=self.away_var, values=choices, width=36, state="normal"
         )
         self.away_box.grid(row=0, column=1, sticky=tk.W, padx=(0, 16))
+        _bind_typeahead(self.away_box, choices)
 
         ttk.Label(row1, text="vs").grid(row=0, column=2, padx=4)
 
@@ -134,6 +160,7 @@ class NbaPickerApp(tk.Tk):
             row1, textvariable=self.home_var, values=choices, width=36, state="normal"
         )
         self.home_box.grid(row=0, column=4, sticky=tk.W)
+        _bind_typeahead(self.home_box, choices)
 
         row2 = ttk.Frame(form)
         row2.pack(fill=tk.X, pady=(10, 2))
@@ -154,7 +181,7 @@ class NbaPickerApp(tk.Tk):
             row2,
             textvariable=self.sims_var,
             values=sim_labels,
-            width=8,
+            width=10,
             state="readonly",
         )
         self.sims_box.pack(side=tk.LEFT, padx=(6, 16))
@@ -168,36 +195,48 @@ class NbaPickerApp(tk.Tk):
         self.run_btn.pack(side=tk.LEFT, padx=2)
 
         self.hint_var = tk.StringVar(
-            value="Pick Away, Home, Date, and Sims — then Run. Only scheduled games that day."
+            value="Type to search Away/Home, pick Date + Sims, then Run. "
+            "Only scheduled games that day."
         )
-        ttk.Label(form, textvariable=self.hint_var, wraplength=820).pack(
+        ttk.Label(form, textvariable=self.hint_var, wraplength=860).pack(
             anchor=tk.W, pady=(8, 0)
         )
 
-        results_frame = ttk.LabelFrame(self, text="Results (AI paste)", padding=8)
-        results_frame.pack(fill=tk.BOTH, expand=True, **pad)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, **pad)
 
-        text_frame = ttk.Frame(results_frame)
-        text_frame.pack(fill=tk.BOTH, expand=True)
-        self.results = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 10))
-        scroll_r = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.results.yview)
-        self.results.configure(yscrollcommand=scroll_r.set)
-        self.results.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll_r.pack(side=tk.RIGHT, fill=tk.Y)
+        results_tab = ttk.Frame(self.notebook, padding=4)
+        quarters_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(results_tab, text="Results")
+        self.notebook.add(quarters_tab, text="Quarters")
+
+        self.results = self._make_text(results_tab)
+        self.quarters_view = self._make_text(quarters_tab)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, **pad)
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT)
-        ttk.Button(bottom, text="Open markdown…", command=self.open_markdown).pack(
+        ttk.Button(bottom, text="Open markdown...", command=self.open_markdown).pack(
             side=tk.RIGHT, padx=2
         )
         ttk.Button(bottom, text="Copy AI paste", command=self.copy_ai_paste).pack(
             side=tk.RIGHT, padx=2
         )
-        ttk.Button(bottom, text="Save results…", command=self.save_results).pack(
+        ttk.Button(bottom, text="Save results...", command=self.save_results).pack(
             side=tk.RIGHT, padx=2
         )
+
+    @staticmethod
+    def _make_text(parent: ttk.Frame) -> tk.Text:
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.BOTH, expand=True)
+        text = tk.Text(frame, wrap=tk.WORD, font=("Consolas", 10), state=tk.NORMAL)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        return text
 
     def _parse_date(self) -> date | None:
         raw = self.date_var.get().strip()
@@ -242,12 +281,11 @@ class NbaPickerApp(tk.Tk):
         if msg:
             self.status_var.set(msg)
 
-    def _write_results(self, text: str) -> None:
-        self.results.configure(state=tk.NORMAL)
-        self.results.delete("1.0", tk.END)
-        # Tk Text is unicode-capable; still sanitize so status/clipboard paths stay safe
-        self.results.insert(tk.END, ascii_safe(text))
-        self.results.see("1.0")
+    def _write_pane(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, ascii_safe(text))
+        widget.see("1.0")
 
     def on_run(self) -> None:
         if self._busy:
@@ -260,11 +298,14 @@ class NbaPickerApp(tk.Tk):
             return
         away, home = matchup
         sim_count = self._selected_sims()
-        self._set_busy(
-            True,
-            f"Checking schedule for {away} @ {home} on {target.isoformat()} "
-            f"({sim_count:,} sims)…",
+        big = sim_count >= config.SIM_PROGRESS_THRESHOLD
+        status = (
+            f"Running {away} @ {home} on {target.isoformat()} "
+            f"({sim_count:,} sims"
+            + (" - large run, please wait..." if big else "")
+            + ")..."
         )
+        self._set_busy(True, status)
 
         def work() -> None:
             err: Exception | None = None
@@ -313,7 +354,8 @@ class NbaPickerApp(tk.Tk):
                     self.hint_var.set(
                         f"{away} @ {home} is not scheduled on {target.isoformat()}."
                     )
-                    self._write_results(ascii_safe(not_scheduled_msg))
+                    self._write_pane(self.results, ascii_safe(not_scheduled_msg))
+                    self._write_pane(self.quarters_view, "")
                     self.status_var.set("Not on schedule for that date.")
                     messagebox.showwarning("Not scheduled", ascii_safe(not_scheduled_msg))
                     return
@@ -324,7 +366,8 @@ class NbaPickerApp(tk.Tk):
                         f"No projection returned for {away} @ {home} on "
                         f"{target.isoformat()}."
                     )
-                    self._write_results(msg)
+                    self._write_pane(self.results, msg)
+                    self._write_pane(self.quarters_view, "")
                     self.status_var.set(msg)
                     return
 
@@ -335,34 +378,224 @@ class NbaPickerApp(tk.Tk):
                 self._last_md_path = payload.get("md_path")
                 self._last_ai = payload.get("ai_paste") or ""
                 self._last_ai_path = payload.get("ai_paste_path")
-                self._write_results(self._plain_from_payload(payload))
-                self.hint_var.set(f"{away} @ {home} · {target.isoformat()}")
+                self._last_payload = payload
+                self._write_pane(self.results, self._format_results(payload))
+                self._write_pane(self.quarters_view, self._format_quarters(payload))
+                self.notebook.select(0)
+                self.hint_var.set(f"{away} @ {home} | {target.isoformat()}")
+                elapsed = None
+                if preds:
+                    elapsed = preds[0].get("sim_elapsed_sec")
                 ai = payload.get("ai_paste_path") or ""
-                self.status_var.set(
-                    f"Done — {away} @ {home}."
-                    + (f" AI paste: {ai}" if ai else "")
-                )
+                status_bits = [f"Done - {away} @ {home} ({sim_count:,} sims)"]
+                if elapsed is not None:
+                    status_bits.append(f"MC {elapsed:.2f}s")
+                if ai:
+                    status_bits.append(f"AI paste: {ai}")
+                self.status_var.set(". ".join(status_bits))
 
             self.after(0, done)
 
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
-    def _plain_from_payload(payload: dict) -> str:
-        ai = (payload.get("ai_paste") or "").strip()
-        if ai:
-            return ai
+    def _fmt_leader(side: dict[str, Any] | None, fallback_team: str) -> str:
+        if not side:
+            return f"{fallback_team} (n/a)"
+        name = side.get("player") or "?"
+        val = side.get("value")
+        team = side.get("team") or fallback_team
+        if val is None:
+            return f"{team} {name} (n/a)"
+        return f"{team} {name} {val}"
+
+    def _format_results(self, payload: dict[str, Any]) -> str:
+        """Readable Results pane: Projection / Highlights / Notes / AI paste."""
         lines: list[str] = []
         d = payload.get("date", "")
-        lines.append(f"NBA PICKER  ·  {d}")
-        lines.append("=" * 60)
-        for p in payload.get("predictions") or []:
+        preds = payload.get("predictions") or []
+        lines.append(f"NBA PICKER  |  {d}")
+        lines.append("=" * 64)
+        lines.append("")
+
+        if not preds:
+            lines.append("No projection for this matchup.")
             lines.append("")
+            return "\n".join(lines)
+
+        for pred in preds:
+            away = pred.get("away_abbr") or "?"
+            home = pred.get("home_abbr") or "?"
+            nsim = pred.get("sim_count") or config.SIM_COUNT
+
+            lines.append("PROJECTION")
+            lines.append("-" * 64)
+            lines.append(f"  {away} @ {home}")
             lines.append(
-                f"{p['away_abbr']} @ {p['home_abbr']}   "
-                f"{p['away_pts']:.1f} – {p['home_pts']:.1f}   "
-                f"P(home)={p['home_win_prob']:.1%}  margin={p['margin']:+.1f}"
+                f"  Mean score (sim n={nsim:,}):  "
+                f"{away} {pred.get('away_pts')}  -  {home} {pred.get('home_pts')}"
             )
+            lines.append(
+                f"  Total {pred.get('total')}   Margin {pred.get('margin'):+.1f} home   "
+                f"Pace {pred.get('pace')}"
+            )
+            lines.append(
+                f"  Win %:  {home} {float(pred.get('home_win_prob') or 0):.1%}  /  "
+                f"{away} {float(pred.get('away_win_prob') or 0):.1%}  "
+                f"(confidence {pred.get('confidence')})"
+            )
+            sims = pred.get("sims") or {}
+            if sims:
+                lines.append(
+                    f"  Score band p10-p90:  {away} {sims.get('away_pts_p10')}-"
+                    f"{sims.get('away_pts_p90')}  /  {home} {sims.get('home_pts_p10')}-"
+                    f"{sims.get('home_pts_p90')}  "
+                    f"(total {sims.get('total_p10')}-{sims.get('total_p90')})"
+                )
+            tags = pred.get("form_tags") or []
+            if tags:
+                lines.append("  Form tags: " + ", ".join(tags))
+            if pred.get("clutch_q4"):
+                lines.append("  Clutch: Q4 weighting ON (projected close)")
+            elapsed = pred.get("sim_elapsed_sec")
+            if elapsed is not None and int(nsim) >= config.SIM_PROGRESS_THRESHOLD:
+                lines.append(f"  Sims runtime: {elapsed:.2f}s")
+            lines.append("")
+
+            lines.append("HIGHLIGHTS  (projected this game - sim mean)")
+            lines.append("-" * 64)
+            highlights = pred.get("highlights") or []
+            if not highlights:
+                lines.append("  (no projected leaders)")
+            else:
+                for h in highlights:
+                    title = h.get("title") or HIGHLIGHT_TITLES.get(h.get("stat"), h.get("stat"))
+                    away_s = self._fmt_leader(h.get("away"), away)
+                    home_s = self._fmt_leader(h.get("home"), home)
+                    lines.append(f"  {title:10}  {away_s}")
+                    lines.append(f"  {'':10}  {home_s}")
+            lines.append("")
+
+            lines.append("NOTES")
+            lines.append("-" * 64)
+            notes = pred.get("notes") or {}
+            any_note = False
+            for label, key in (
+                ("Injuries", "injuries"),
+                ("Hot/cold", "form"),
+                ("Quarter edges", "quarters"),
+                ("Rest / travel", "rest_travel"),
+                ("Play-types", "play_types"),
+            ):
+                vals = notes.get(key) or []
+                if not vals:
+                    continue
+                any_note = True
+                joined = "; ".join(vals) if isinstance(vals[0], str) else str(vals)
+                lines.append(f"  {label}: {joined}")
+            if not any_note:
+                lines.append("  (none)")
+            lines.append("")
+
+        lines.append("AI PASTE  (copyable block - use Copy AI paste button)")
+        lines.append("-" * 64)
+        ai = (payload.get("ai_paste") or "").strip()
+        if ai:
+            lines.append(ai)
+        else:
+            lines.append("(run produced no AI paste)")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_quarters(payload: dict[str, Any]) -> str:
+        """Quarters tab: Q1-Q4 projected scores, edges, tendency + efficiency."""
+        lines: list[str] = []
+        d = payload.get("date", "")
+        preds = payload.get("predictions") or []
+        lines.append(f"QUARTER BY QUARTER  |  {d}")
+        lines.append("=" * 64)
+        lines.append("")
+        if not preds:
+            lines.append("No quarter breakdown available.")
+            lines.append("")
+            return "\n".join(lines)
+
+        for pred in preds:
+            away = pred.get("away_abbr") or "?"
+            home = pred.get("home_abbr") or "?"
+            qblock = pred.get("quarters") or {}
+            lines.append(f"{away} @ {home}")
+            lines.append("-" * 64)
+            lines.append(
+                f"  Game totals (sim mean):  {away} {pred.get('away_pts')}  -  "
+                f"{home} {pred.get('home_pts')}  (total {pred.get('total')})"
+            )
+            if pred.get("clutch_q4"):
+                lines.append("  Clutch Q4 weighting: ON")
+            lines.append("")
+
+            quarters = qblock.get("quarters") or []
+            if not quarters:
+                lines.append("  (no quarter profiles - schedule lookback empty)")
+                lines.append("")
+                continue
+
+            lines.append(
+                f"  {'Qtr':<4}  {away:>8}  {home:>8}  {'Edge(H)':>8}  "
+                f"{'Tend '+away:>10}  {'Tend '+home:>10}"
+            )
+            lines.append("  " + "-" * 58)
+            for q in quarters:
+                label = q.get("label") or f"Q{q.get('quarter')}"
+                a_pts = q.get("away_pts")
+                h_pts = q.get("home_pts")
+                edge = q.get("edge_home")
+                a_tend = q.get("away_tendency")
+                h_tend = q.get("home_tendency")
+                lines.append(
+                    f"  {label:<4}  {a_pts!s:>8}  {h_pts!s:>8}  "
+                    f"{edge!s:>8}  {a_tend!s:>10}  {h_tend!s:>10}"
+                )
+            lines.append("")
+
+            lines.append("  Tendency (recent lookback avg pts / allow)")
+            for q in quarters:
+                label = q.get("label") or f"Q{q.get('quarter')}"
+                a_off = q.get("away_tendency")
+                h_off = q.get("home_tendency")
+                a_all = q.get("away_allow")
+                h_all = q.get("home_allow")
+                te = q.get("tendency_edge_home")
+                te_s = f"{te:+.2f}" if te is not None else "n/a"
+                lines.append(
+                    f"  {label}: {away} off {a_off} allow {a_all}  |  "
+                    f"{home} off {h_off} allow {h_all}  |  edge {te_s}"
+                )
+            lines.append("")
+
+            eff = qblock.get("efficiency") or {}
+            lines.append("  Efficiency / pace summary")
+            lines.append(
+                f"  Pace {eff.get('pace')}   "
+                f"poss/Q proxy {eff.get('poss_per_quarter_proxy')}   "
+                f"pts/poss {away} {eff.get('away_pts_per_poss_proxy')}  "
+                f"{home} {eff.get('home_pts_per_poss_proxy')}"
+            )
+            lines.append(
+                f"  Sample games: {away} {eff.get('away_games_sample')}  "
+                f"{home} {eff.get('home_games_sample')}   "
+                f"basis: {qblock.get('basis')}"
+            )
+            notes = (pred.get("notes") or {}).get("quarters") or []
+            if notes:
+                lines.append("  Matchup notes: " + "; ".join(notes))
+            lines.append("")
+
+        lines.append(
+            "Projected quarter scores scale each team's recent Q1-Q4 scoring "
+            "share to the sim-mean team total."
+        )
         lines.append("")
         return "\n".join(lines)
 
@@ -400,7 +633,7 @@ class NbaPickerApp(tk.Tk):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not open %s: %s", path, exc)
         if self._last_md:
-            self._write_results(self._last_md)
+            self._write_pane(self.results, self._last_md)
             self.status_var.set("Showing markdown in results pane.")
         else:
             messagebox.showinfo("Open markdown", "Run the model first.")
@@ -417,7 +650,7 @@ class NbaPickerApp(tk.Tk):
                 ("Markdown", "*.md"),
                 ("All files", "*.*"),
             ],
-            initialfile="nba_picker_ai_paste.txt",
+            initialfile="nba_picker_results.txt",
         )
         if path:
             Path(path).write_text(text + "\n", encoding="utf-8")

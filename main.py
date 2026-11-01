@@ -74,7 +74,8 @@ def format_markdown(
         f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
         "",
         f"Games: **{len(predictions)}** · Injuries cached: {meta.get('injuries_count', '?')} · "
-        f"Impact rows: {meta.get('impact_count', '?')}",
+        f"Impact rows: {meta.get('impact_count', '?')} · "
+        f"Sims: {meta.get('sim_count', config.SIM_COUNT)}",
         "",
     ]
     if not predictions:
@@ -149,6 +150,7 @@ def _print_team_season(season: dict) -> None:
         ("PTS", "PTS"),
         ("REB", "REB"),
         ("AST", "AST"),
+        ("FG3M", "3PM"),
         ("STL", "STL"),
         ("BLK", "BLK"),
     ):
@@ -283,7 +285,7 @@ def run_pipeline(
 
     ``matchup`` is ``(away_abbr, home_abbr)`` and takes precedence over
     ``team_filter`` when set.
-    ``sim_count`` overrides Monte Carlo runs (5000 / 10000 / 25000 / 50000).
+    ``sim_count`` overrides Monte Carlo runs (5k / 10k / 25k / 50k / 100k / 250k / 1M).
     """
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

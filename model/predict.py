@@ -1,9 +1,10 @@
-"""Generate team ratings, projected scores, win probs via 10k Monte Carlo."""
+"""Generate team ratings, projected scores, win probs via Monte Carlo sims."""
 
 from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,7 @@ import config
 from data.process import (
     home_road_matchup_residual,
     playtype_matchup_residual,
+    project_quarter_breakdown,
     quarter_matchup_residual,
     shot_profile_residual,
 )
@@ -229,7 +231,8 @@ def _mean_scores(
         clutch=clutch,
     )
     matchup_edge += q_edge
-    matchup_notes = list(matchup_notes) + list(q_notes)
+    # Keep quarter notes separate from play-type / shot / home-road notes
+    playtype_notes = list(matchup_notes)
 
     matchup_edge = float(
         np.clip(matchup_edge, -config.MATCHUP_RESIDUAL_CAP - 1.5, config.MATCHUP_RESIDUAL_CAP + 1.5)
@@ -266,7 +269,7 @@ def _mean_scores(
         "w_sample": w_sample,
         "games_n": games_n,
         "matchup_edge": matchup_edge,
-        "matchup_notes": matchup_notes,
+        "matchup_notes": playtype_notes,
         "quarter_notes": q_notes,
         "form_notes": form_notes,
         "player_form_notes": player_notes[:4],
@@ -303,6 +306,9 @@ def simulate_game(
     """
     n = _normalize_sim_count(n)
     n = max(100, n)
+    if n >= config.SIM_PROGRESS_THRESHOLD:
+        logger.info("Running %s Monte Carlo sims (vectorized)...", f"{n:,}")
+    t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
     sig = config.SCORE_SIGMA
     # Correlation ~0.15 between team scores (pace/shared environment)
@@ -324,6 +330,14 @@ def simulate_game(
 
     margins = home - away
     totals = home + away
+    elapsed = time.perf_counter() - t0
+    if n >= config.SIM_PROGRESS_THRESHOLD:
+        logger.info("Finished %s sims in %.3fs", f"{n:,}", elapsed)
+    if n >= 1_000_000 and elapsed > 2.0:
+        logger.warning(
+            "1,000,000 sims took %.1fs - still usable; prefer 100k/250k for interactive runs",
+            elapsed,
+        )
     return {
         "sim_count": n,
         "home_win_prob": float(home_wins.mean()),
@@ -342,6 +356,7 @@ def simulate_game(
         "cover_home_minus_3": float((margins > 3.0).mean()),
         "cover_home_minus_5": float((margins > 5.0).mean()),
         "over_225": float((totals > 225.0).mean()),
+        "elapsed_sec": round(elapsed, 4),
     }
 
 
@@ -394,6 +409,16 @@ def project_game(
         if tag in {"HOT", "COLD"}:
             form_tags.append(f"{side_form.get('team')} {tag}")
 
+    quarters = project_quarter_breakdown(
+        features.get("quarter_profiles") or {},
+        home,
+        away,
+        mean_h,
+        mean_a,
+        clutch=bool(meta.get("clutch")),
+        pace=meta.get("pace"),
+    )
+
     return {
         "game_id": game.get("game_id"),
         "game_date": game.get("game_date"),
@@ -410,8 +435,10 @@ def project_game(
         "confidence": round(confidence, 3),
         "pace": round(meta["pace"], 1),
         "sim_count": sims["sim_count"],
+        "sim_elapsed_sec": sims.get("elapsed_sec"),
         "clutch_q4": bool(meta.get("clutch")),
         "form_tags": form_tags,
+        "quarters": quarters,
         "sims": {
             "home_pts_p10": round(sims["home_pts_p10"], 1),
             "home_pts_p90": round(sims["home_pts_p90"], 1),
