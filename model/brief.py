@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from data.static_arenas import normalize_abbrev
+from model.player_sim import leaders_from_maxes, leaders_from_means
 
 logger = logging.getLogger(__name__)
 
@@ -272,8 +273,9 @@ def enrich_predictions_with_brief(
     features: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """
-    Attach season win% / avg total (context) and top-3 **projected this game**
-    leaders (sim-mean team score + minutes-scaled rates) to each game.
+    Attach season win% / avg total (context) and top-3 **sim-mean** leaders
+    from the player-level Monte Carlo pipeline. Highlights use sim-max.
+    Falls back to minutes-scaled rates only if player_sim is missing.
     """
     profiles = team_season_profiles(features.get("team_logs"))
     players = features.get("players")
@@ -281,6 +283,7 @@ def enrich_predictions_with_brief(
     enriched: list[dict[str, Any]] = []
     for pred in predictions:
         p = dict(pred)
+        psim = p.get("player_sim") or {}
         sides = {}
         for side, key, pts_key in (
             ("home", "home_abbr", "home_pts"),
@@ -288,45 +291,82 @@ def enrich_predictions_with_brief(
         ):
             abbr = normalize_abbrev(p.get(key))
             season = dict(profiles.get(abbr) or {"team": abbr})
-            team_pts = p.get(pts_key)
-            try:
-                team_pts_f = float(team_pts) if team_pts is not None else None
-            except (TypeError, ValueError):
-                team_pts_f = None
-            season["top_players"] = projected_game_leaders_for_team(
-                players,
-                minutes,
-                abbr,
-                team_proj_pts=team_pts_f,
-                n=3,
-            )
-            season["leaders_basis"] = "projected_this_game"
+            team_block = psim.get(side) or {}
+            if team_block.get("players"):
+                season["top_players"] = leaders_from_means(team_block, n=3, stats=STAT_KEYS)
+                season["leaders_basis"] = "sim_mean"
+            else:
+                team_pts = p.get(pts_key)
+                try:
+                    team_pts_f = float(team_pts) if team_pts is not None else None
+                except (TypeError, ValueError):
+                    team_pts_f = None
+                season["top_players"] = projected_game_leaders_for_team(
+                    players,
+                    minutes,
+                    abbr,
+                    team_proj_pts=team_pts_f,
+                    n=3,
+                )
+                season["leaders_basis"] = "projected_this_game_fallback"
             sides[side] = season
         p["season"] = sides
         p["highlights"] = matchup_highlights(p)
+        # Compact player_sim for outputs: drop per-player arrays already summarized
+        if psim:
+            p["player_sim"] = {
+                "sim_count": psim.get("sim_count") or p.get("sim_count"),
+                "basis": psim.get("basis") or "monte_carlo_player",
+                "home_n": len((psim.get("home") or {}).get("players") or []),
+                "away_n": len((psim.get("away") or {}).get("players") or []),
+            }
         enriched.append(p)
     return enriched
 
 
 def matchup_highlights(pred: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Away + home projected leaders for PTS / REB / AST / 3PM (sim this-game).
-    Used by the Results Highlights section (outside the AI paste block).
+    Away + home leaders for PTS / REB / AST / 3PM = each team's player with
+    the **highest sim-max** for that stat across N Monte Carlo runs.
     """
     season = pred.get("season") or {}
+    psim = pred.get("player_sim") or {}
+    nsim = int(psim.get("sim_count") or pred.get("sim_count") or 0)
     out: list[dict[str, Any]] = []
+    # Prefer maxes from the live player_sim blob (before compacting in enrich,
+    # matchup_highlights is called while full players are still present).
     for stat in HIGHLIGHT_STATS:
         title = HIGHLIGHT_TITLES.get(stat, stat)
-        row: dict[str, Any] = {"stat": stat, "title": title, "away": None, "home": None}
+        row: dict[str, Any] = {
+            "stat": stat,
+            "title": title,
+            "basis": "sim_max",
+            "sim_count": nsim,
+            "away": None,
+            "home": None,
+        }
         for side in ("away", "home"):
-            tops = ((season.get(side) or {}).get("top_players") or {}).get(stat) or []
-            if tops:
-                lead = tops[0]
+            team_sim = psim.get(side) or {}
+            lead = None
+            if team_sim.get("players"):
+                lead = leaders_from_maxes(team_sim, stats=(stat,)).get(stat)
+            if lead is None:
+                # Fallback: top mean (should not happen when player_sim ran)
+                tops = ((season.get(side) or {}).get("top_players") or {}).get(stat) or []
+                if tops:
+                    lead = {
+                        "player": tops[0].get("player"),
+                        "value": tops[0].get("value"),
+                        "adj_minutes": tops[0].get("adj_minutes"),
+                        "basis": "sim_mean_fallback",
+                    }
+            if lead:
                 row[side] = {
                     "player": lead.get("player"),
                     "value": lead.get("value"),
                     "team": (season.get(side) or {}).get("team") or pred.get(f"{side}_abbr"),
                     "adj_minutes": lead.get("adj_minutes"),
+                    "basis": lead.get("basis") or "sim_max",
                 }
         out.append(row)
     return out
@@ -358,7 +398,7 @@ def _team_block(label: str, season: dict[str, Any]) -> list[str]:
             if avg_pts is not None and avg_opp is not None
             else ""
         ),
-        "- **Top 3 players (projected this game, sim mean):**",
+        "- **Top 3 players (this game, Monte Carlo sim mean):**",
     ]
     tops = season.get("top_players") or {}
     for stat, title in (
@@ -388,11 +428,12 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
         f"Slate date: {target_date}",
         f"Monte Carlo sims per game: n={sim_n}",
         "",
-        "Use model projections and projected-this-game player leaders below "
+        "Use model projections and this-game player leaders below "
         "(plus season win rate / avg totals as context) to suggest good wagers. "
         "This app does not fetch book odds.",
-        "Player leaders are projected for THIS game (minutes x rates, scaled to "
-        "sim mean team score) — not season per-game averages.",
+        "Player leaders are Monte Carlo sim MEANS for THIS game (player-level "
+        "draws consistent with team score/pace/minutes) - not season per-game "
+        "averages and not a simple rate x minutes scale.",
         "Tags: HOT/COLD = recent form; quarter edges = Q1-Q4 tendency matchup; "
         "clutch Q4 = close-game weighting.",
         "",
@@ -475,8 +516,8 @@ def format_ai_paste_markdown(target_date: str, predictions: list[dict[str, Any]]
         "",
         "_Copy everything under this heading into another AI for wager ideas. "
         "Includes season win rate / avg combined score (context) and top-3 "
-        "players by **projected this game** PTS / REB / AST / 3PM / STL / BLK "
-        "(sim mean — not season per-game)._",
+        "players by **Monte Carlo sim mean** PTS / REB / AST / 3PM / STL / BLK "
+        "(player-level draws this game - not season per-game)._",
         "",
         f"Slate date: **{target_date}**",
         "",

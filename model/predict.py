@@ -19,6 +19,7 @@ from data.process import (
     shot_profile_residual,
 )
 from data.static_arenas import normalize_abbrev
+from model.player_sim import run_matchup_player_sims
 
 logger = logging.getLogger(__name__)
 
@@ -299,10 +300,13 @@ def simulate_game(
     *,
     n: int | None = None,
     seed: int | None = None,
+    return_scores: bool = False,
 ) -> dict[str, Any]:
     """
     Vectorized Monte Carlo: correlated score noise around mean projections.
     Returns win rates + score distribution summaries (not extra scrapes).
+    When return_scores=True, also includes home_scores / away_scores arrays
+    for player-level sims (not serialized to JSON).
     """
     n = _normalize_sim_count(n)
     n = max(100, n)
@@ -332,13 +336,13 @@ def simulate_game(
     totals = home + away
     elapsed = time.perf_counter() - t0
     if n >= config.SIM_PROGRESS_THRESHOLD:
-        logger.info("Finished %s sims in %.3fs", f"{n:,}", elapsed)
+        logger.info("Finished %s team-score sims in %.3fs", f"{n:,}", elapsed)
     if n >= 1_000_000 and elapsed > 2.0:
         logger.warning(
             "1,000,000 sims took %.1fs - still usable; prefer 100k/250k for interactive runs",
             elapsed,
         )
-    return {
+    out: dict[str, Any] = {
         "sim_count": n,
         "home_win_prob": float(home_wins.mean()),
         "away_win_prob": float(1.0 - home_wins.mean()),
@@ -358,6 +362,10 @@ def simulate_game(
         "over_225": float((totals > 225.0).mean()),
         "elapsed_sec": round(elapsed, 4),
     }
+    if return_scores:
+        out["home_scores"] = home
+        out["away_scores"] = away
+    return out
 
 
 def project_game(
@@ -375,13 +383,43 @@ def project_game(
     # Deterministic seed from game_id for stable re-runs
     gid = str(game.get("game_id") or f"{away}{home}{game.get('game_date')}")
     seed = abs(hash(gid)) % (2**32 - 1)
-    sims = simulate_game(home_pts, away_pts, n=sim_count, seed=seed)
+    sims = simulate_game(
+        home_pts, away_pts, n=sim_count, seed=seed, return_scores=True
+    )
 
     # Prefer sim win% ; mean scores from sims (close to analytic means)
     win_p = sims["home_win_prob"]
     mean_h = sims["home_pts_mean"]
     mean_a = sims["away_pts_mean"]
     margin = mean_h - mean_a
+
+    # Player-level MC on the same score paths (means for AI paste, maxes for Highlights)
+    t_player = time.perf_counter()
+    if sims["sim_count"] >= config.SIM_PROGRESS_THRESHOLD:
+        logger.info(
+            "Running player-level MC for %s @ %s (%s sims)...",
+            away,
+            home,
+            f"{sims['sim_count']:,}",
+        )
+    player_sim = run_matchup_player_sims(
+        features,
+        home,
+        away,
+        sims["home_scores"],
+        sims["away_scores"],
+        seed=(seed + 17) % (2**32 - 1),
+    )
+    player_elapsed = time.perf_counter() - t_player
+    if sims["sim_count"] >= config.SIM_PROGRESS_THRESHOLD:
+        logger.info(
+            "Player-level MC finished in %.3fs (team-score MC %.3fs)",
+            player_elapsed,
+            float(sims.get("elapsed_sec") or 0.0),
+        )
+    # Drop raw score arrays — not JSON-serializable at 1M
+    sims.pop("home_scores", None)
+    sims.pop("away_scores", None)
 
     games_n = meta["games_n"]
     confidence = float(np.clip(0.40 + 0.025 * games_n, 0.40, 0.88))
@@ -419,6 +457,10 @@ def project_game(
         pace=meta.get("pace"),
     )
 
+    total_elapsed = round(
+        float(sims.get("elapsed_sec") or 0.0) + player_elapsed, 4
+    )
+
     return {
         "game_id": game.get("game_id"),
         "game_date": game.get("game_date"),
@@ -435,10 +477,11 @@ def project_game(
         "confidence": round(confidence, 3),
         "pace": round(meta["pace"], 1),
         "sim_count": sims["sim_count"],
-        "sim_elapsed_sec": sims.get("elapsed_sec"),
+        "sim_elapsed_sec": total_elapsed,
         "clutch_q4": bool(meta.get("clutch")),
         "form_tags": form_tags,
         "quarters": quarters,
+        "player_sim": player_sim,
         "sims": {
             "home_pts_p10": round(sims["home_pts_p10"], 1),
             "home_pts_p90": round(sims["home_pts_p90"], 1),

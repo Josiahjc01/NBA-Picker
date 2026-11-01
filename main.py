@@ -145,7 +145,7 @@ def _print_team_season(season: dict) -> None:
     print(f"      {abbr}: season win {win_s}  season avg total {tot_s}")
     tops = season.get("top_players") or {}
     if tops:
-        print("        Top 3 (projected this game, sim mean):")
+        print("        Top 3 (this game, MC sim mean):")
     for stat, title in (
         ("PTS", "PTS"),
         ("REB", "REB"),
