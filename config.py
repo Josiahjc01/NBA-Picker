@@ -44,7 +44,9 @@ SRS_ITERATIONS = int(os.getenv("SRS_ITERATIONS", "10"))
 SRS_BLEND = float(os.getenv("SRS_BLEND", "0.55"))  # how much SRS net replaces raw net
 
 # Allowed Monte Carlo sim counts (GUI + CLI)
-SIM_COUNT_CHOICES = (5000, 10000, 25000, 50000)
+SIM_COUNT_CHOICES = (5000, 10000, 25000, 50000, 100000, 250000, 1000000)
+# Warn / progress logging when sim count is at or above this
+SIM_PROGRESS_THRESHOLD = int(os.getenv("SIM_PROGRESS_THRESHOLD", "100000"))
 
 # Denver altitude residual (points / pace)
 ALTITUDE_HOME_POINTS = float(os.getenv("ALTITUDE_HOME_POINTS", "1.4"))

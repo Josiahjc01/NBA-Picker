@@ -812,6 +812,121 @@ def quarter_matchup_residual(
     return edge, notes[:3]
 
 
+def project_quarter_breakdown(
+    profiles: dict[str, dict[str, Any]],
+    home: str,
+    away: str,
+    home_pts: float,
+    away_pts: float,
+    *,
+    clutch: bool = False,
+    pace: float | None = None,
+) -> dict[str, Any]:
+    """
+    Projected Q1-Q4 scores for both teams from tendency profiles, scaled so
+    each team's quarters sum to the sim-mean team total.
+    """
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+    hp = (profiles or {}).get(home) or {}
+    ap = (profiles or {}).get(away) or {}
+    lg = 28.0
+
+    def _shares(prof: dict[str, Any]) -> list[float]:
+        raw: list[float] = []
+        for q in (1, 2, 3, 4):
+            v = prof.get(f"q{q}_pts")
+            try:
+                fv = float(v) if v is not None else lg
+            except (TypeError, ValueError):
+                fv = lg
+            if not np.isfinite(fv) or fv <= 0:
+                fv = lg
+            raw.append(fv)
+        s = sum(raw) or 1.0
+        return [x / s for x in raw]
+
+    def _scale(shares: list[float], total: float) -> list[float]:
+        total = float(total) if np.isfinite(total) else 4.0 * lg
+        return [round(total * w, 1) for w in shares]
+
+    h_shares = _shares(hp)
+    a_shares = _shares(ap)
+    h_proj = _scale(h_shares, home_pts)
+    a_proj = _scale(a_shares, away_pts)
+
+    # Tiny residual so displayed quarters still sum to team totals after rounding
+    def _fix_sum(vals: list[float], target: float) -> list[float]:
+        if not vals:
+            return vals
+        diff = round(float(target) - sum(vals), 1)
+        vals = list(vals)
+        vals[-1] = round(vals[-1] + diff, 1)
+        return vals
+
+    h_proj = _fix_sum(h_proj, home_pts)
+    a_proj = _fix_sum(a_proj, away_pts)
+
+    quarters: list[dict[str, Any]] = []
+    for i, q in enumerate((1, 2, 3, 4)):
+        h_off = hp.get(f"q{q}_pts")
+        a_off = ap.get(f"q{q}_pts")
+        h_def = hp.get(f"q{q}_opp")
+        a_def = ap.get(f"q{q}_opp")
+        h_tend = round(float(h_off), 1) if h_off is not None else None
+        a_tend = round(float(a_off), 1) if a_off is not None else None
+        h_allow = round(float(h_def), 1) if h_def is not None else None
+        a_allow = round(float(a_def), 1) if a_def is not None else None
+        edge = round(h_proj[i] - a_proj[i], 1)
+        # Tendency matchup edge (offense vs opp allow), unscaled
+        tend_edge = None
+        if None not in (h_off, a_off, h_def, a_def):
+            h_edge = (float(h_off) - lg) + (float(a_def) - lg)
+            a_edge = (float(a_off) - lg) + (float(h_def) - lg)
+            tend_edge = round(0.10 * (h_edge - a_edge), 2)
+        quarters.append(
+            {
+                "quarter": q,
+                "label": f"Q{q}",
+                "away_pts": a_proj[i],
+                "home_pts": h_proj[i],
+                "edge_home": edge,
+                "away_tendency": a_tend,
+                "home_tendency": h_tend,
+                "away_allow": a_allow,
+                "home_allow": h_allow,
+                "tendency_edge_home": tend_edge,
+            }
+        )
+
+    pace_f = float(pace) if pace is not None and np.isfinite(pace) else None
+    # Rough possessions proxy per quarter (~25% of pace)
+    poss_q = round(pace_f / 4.0, 1) if pace_f else None
+    efficiency = {
+        "pace": round(pace_f, 1) if pace_f else None,
+        "poss_per_quarter_proxy": poss_q,
+        "away_pts_per_poss_proxy": (
+            round(float(away_pts) / pace_f, 3) if pace_f and pace_f > 0 else None
+        ),
+        "home_pts_per_poss_proxy": (
+            round(float(home_pts) / pace_f, 3) if pace_f and pace_f > 0 else None
+        ),
+        "clutch_q4": bool(clutch),
+        "away_games_sample": int(ap.get("games") or 0),
+        "home_games_sample": int(hp.get("games") or 0),
+    }
+
+    return {
+        "away_abbr": away,
+        "home_abbr": home,
+        "away_total": round(float(away_pts), 1),
+        "home_total": round(float(home_pts), 1),
+        "quarters": quarters,
+        "efficiency": efficiency,
+        "basis": "tendency_scaled_to_sim_mean",
+    }
+
+
 def _injury_team_matches(inj: dict[str, Any], team: str) -> bool:
     """True when injury row is for this team abbr (or team name contains abbr/city)."""
     team_u = normalize_abbrev(team)
