@@ -1,8 +1,9 @@
-"""Season averages + player leaders for AI paste / wager-assistant context."""
+"""Season context + projected-this-game player leaders for AI paste."""
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import numpy as np
@@ -20,6 +21,8 @@ STAT_ALIASES: dict[str, tuple[str, ...]] = {
     "STL": ("STL", "stl", "avgSteals"),
     "BLK": ("BLK", "blk", "avgBlocks"),
 }
+# Exclude inactive / DNP from projected leaders
+MIN_ADJ_MINUTES_FOR_LEADERS = 1.0
 
 
 def _col(df: pd.DataFrame, *names: str) -> str | None:
@@ -30,6 +33,10 @@ def _col(df: pd.DataFrame, *names: str) -> str | None:
         if n.upper() in upper:
             return upper[n.upper()]
     return None
+
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
 
 
 def team_season_profiles(team_logs: pd.DataFrame | None) -> dict[str, dict[str, Any]]:
@@ -98,38 +105,148 @@ def _stat_series(df: pd.DataFrame, stat: str) -> pd.Series:
     return pd.Series(np.nan, index=df.index)
 
 
-def top_players_for_team(
+def _season_stat_by_name(players: pd.DataFrame | None) -> dict[str, dict[str, float]]:
+    """Normalized player name -> season per-game counting stats + season minutes."""
+    out: dict[str, dict[str, float]] = {}
+    if players is None or (isinstance(players, pd.DataFrame) and players.empty):
+        return out
+    df = players.copy()
+    name_c = _col(df, "PLAYER_NAME", "player", "PLAYER")
+    if not name_c:
+        return out
+    min_c = _col(df, "MIN", "minutes")
+    for _, row in df.iterrows():
+        key = _norm_name(row.get(name_c))
+        if not key:
+            continue
+        entry: dict[str, float] = {}
+        if min_c:
+            try:
+                entry["MIN"] = float(pd.to_numeric(row.get(min_c), errors="coerce") or 0.0)
+            except (TypeError, ValueError):
+                entry["MIN"] = 0.0
+        else:
+            entry["MIN"] = 0.0
+        for stat in STAT_KEYS:
+            aliases = STAT_ALIASES.get(stat, (stat,))
+            val = None
+            for a in aliases:
+                c = _col(df, a)
+                if not c:
+                    continue
+                try:
+                    v = float(pd.to_numeric(row.get(c), errors="coerce"))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(v):
+                    val = v
+                    break
+            if val is not None:
+                entry[stat] = val
+        # Prefer first row; roster-aligned frames are unique by name
+        if key not in out or (entry.get("MIN") or 0) > (out[key].get("MIN") or 0):
+            out[key] = entry
+    return out
+
+
+def projected_game_leaders_for_team(
     players: pd.DataFrame | None,
+    minutes: pd.DataFrame | None,
     team: str,
     *,
+    team_proj_pts: float | None = None,
     n: int = 3,
+    min_adj_minutes: float = MIN_ADJ_MINUTES_FOR_LEADERS,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Top-n players per counting-stat category for one team."""
+    """
+    Top-n players by **projected this-game** counting stats.
+
+    Uses season per-game rates scaled by adj_minutes / season_minutes (injury /
+    inactive minutes already applied). Players with adj_minutes below the floor
+    are excluded. Team membership comes from the minutes frame (roster-aligned),
+    not a soft cross-team name match.
+    """
     empty = {s: [] for s in STAT_KEYS}
-    if players is None or players.empty:
-        return empty
     abbr = normalize_abbrev(team)
-    df = players.copy()
-    team_c = _col(df, "TEAM_ABBREVIATION", "team_abbreviation", "team")
-    name_c = _col(df, "PLAYER_NAME", "player", "PLAYER")
-    if not team_c or not name_c:
+    if minutes is None or (isinstance(minutes, pd.DataFrame) and minutes.empty):
         return empty
-    df["_abbr"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
-    team_df = df[df["_abbr"] == abbr]
-    if team_df.empty:
+    if "team" not in minutes.columns or "player" not in minutes.columns:
         return empty
+
+    team_min = minutes[minutes["team"].map(lambda x: normalize_abbrev(str(x))) == abbr].copy()
+    if team_min.empty:
+        return empty
+    team_min["_adj"] = pd.to_numeric(team_min.get("adj_minutes"), errors="coerce").fillna(0.0)
+    team_min = team_min[team_min["_adj"] >= float(min_adj_minutes)]
+    if team_min.empty:
+        return empty
+
+    season_by = _season_stat_by_name(players)
+    rows: list[dict[str, Any]] = []
+    for _, r in team_min.iterrows():
+        name = str(r.get("player") or "")
+        key = _norm_name(name)
+        adj = float(r["_adj"])
+        season = season_by.get(key) or {}
+        season_min = float(season.get("MIN") or 0.0)
+        # Scale factor: this-game minutes vs season average minutes
+        if season_min >= 5.0:
+            scale = adj / season_min
+        elif season_min > 0:
+            scale = adj / max(season_min, 1.0)
+        else:
+            # Roster-only / no season line — skip counting leaders (no rate basis)
+            continue
+        proj: dict[str, Any] = {
+            "player": name,
+            "team": abbr,
+            "adj_minutes": round(adj, 1),
+        }
+        has_any = False
+        for stat in STAT_KEYS:
+            base = season.get(stat)
+            if base is None or not np.isfinite(base):
+                proj[stat] = None
+                continue
+            # Per-game season rate × minutes scale → projected this game
+            val = float(base) * scale
+            # Soft floors for counting stats
+            if stat in ("STL", "BLK") and val < 0:
+                val = 0.0
+            proj[stat] = float(val)
+            has_any = True
+        if has_any:
+            rows.append(proj)
+
+    if not rows:
+        return empty
+
+    # Align projected PTS shares to team sim mean when the active roster
+    # already explains most of the team total (avoid exploding thin samples).
+    if team_proj_pts is not None and np.isfinite(team_proj_pts) and team_proj_pts > 0:
+        pts_vals = [float(r["PTS"]) for r in rows if r.get("PTS") is not None]
+        pts_sum = sum(pts_vals)
+        if len(pts_vals) >= 5 and pts_sum >= 0.55 * float(team_proj_pts):
+            factor = float(team_proj_pts) / pts_sum
+            factor = float(np.clip(factor, 0.70, 1.35))
+            for r in rows:
+                if r.get("PTS") is not None:
+                    r["PTS"] = float(r["PTS"]) * factor
 
     leaders: dict[str, list[dict[str, Any]]] = {}
     for stat in STAT_KEYS:
-        s = _stat_series(team_df, stat)
-        ranked = team_df.assign(_stat=s).dropna(subset=["_stat"])
-        ranked = ranked.sort_values("_stat", ascending=False).head(n)
+        ranked = sorted(
+            (r for r in rows if r.get(stat) is not None and np.isfinite(r[stat])),
+            key=lambda r: float(r[stat]),
+            reverse=True,
+        )[:n]
         leaders[stat] = [
             {
-                "player": str(r[name_c]),
-                "value": round(float(r["_stat"]), 1),
+                "player": str(r["player"]),
+                "value": round(float(r[stat]), 1),
+                "adj_minutes": r.get("adj_minutes"),
             }
-            for _, r in ranked.iterrows()
+            for r in ranked
         ]
     return leaders
 
@@ -138,17 +255,36 @@ def enrich_predictions_with_brief(
     predictions: list[dict[str, Any]],
     features: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Attach season win%, avg combined total, and top-3 leaders to each game."""
+    """
+    Attach season win% / avg total (context) and top-3 **projected this game**
+    leaders (sim-mean team score + minutes-scaled rates) to each game.
+    """
     profiles = team_season_profiles(features.get("team_logs"))
     players = features.get("players")
+    minutes = features.get("minutes")
     enriched: list[dict[str, Any]] = []
     for pred in predictions:
         p = dict(pred)
         sides = {}
-        for side, key in (("home", "home_abbr"), ("away", "away_abbr")):
+        for side, key, pts_key in (
+            ("home", "home_abbr", "home_pts"),
+            ("away", "away_abbr", "away_pts"),
+        ):
             abbr = normalize_abbrev(p.get(key))
             season = dict(profiles.get(abbr) or {"team": abbr})
-            season["top_players"] = top_players_for_team(players, abbr, n=3)
+            team_pts = p.get(pts_key)
+            try:
+                team_pts_f = float(team_pts) if team_pts is not None else None
+            except (TypeError, ValueError):
+                team_pts_f = None
+            season["top_players"] = projected_game_leaders_for_team(
+                players,
+                minutes,
+                abbr,
+                team_proj_pts=team_pts_f,
+                n=3,
+            )
+            season["leaders_basis"] = "projected_this_game"
             sides[side] = season
         p["season"] = sides
         enriched.append(p)
@@ -172,16 +308,16 @@ def _team_block(label: str, season: dict[str, Any]) -> list[str]:
     lines = [
         f"### {abbr}",
         "",
-        f"- **Win rate:** "
+        f"- **Season win rate:** "
         + (f"{win_pct:.1f}% ({w}-{l})" if win_pct is not None else "n/a"),
-        f"- **Avg combined score (both teams):** "
+        f"- **Season avg combined score (both teams):** "
         + (f"{avg_total:.1f}" if avg_total is not None else "n/a")
         + (
             f" (team {avg_pts:.1f} + opp {avg_opp:.1f})"
             if avg_pts is not None and avg_opp is not None
             else ""
         ),
-        "- **Top 3 players (season per-game):**",
+        "- **Top 3 players (projected this game, sim mean):**",
     ]
     tops = season.get("top_players") or {}
     for stat, title in (
@@ -199,7 +335,7 @@ def _team_block(label: str, season: dict[str, Any]) -> list[str]:
 def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
     """
     Plain, paste-friendly block for an external AI to suggest wagers from.
-    Includes model projections plus season win%, avg totals, and player leaders.
+    Includes model projections, season context, and projected-this-game leaders.
     """
     sim_n = next(
         (p.get("sim_count") for p in predictions if p.get("sim_count")),
@@ -210,8 +346,11 @@ def format_ai_paste(target_date: str, predictions: list[dict[str, Any]]) -> str:
         f"Slate date: {target_date}",
         f"Monte Carlo sims per game: n={sim_n}",
         "",
-        "Use the season rates and player leaders below (with model projections) "
-        "to suggest good wagers. This app does not fetch book odds.",
+        "Use model projections and projected-this-game player leaders below "
+        "(plus season win rate / avg totals as context) to suggest good wagers. "
+        "This app does not fetch book odds.",
+        "Player leaders are projected for THIS game (minutes x rates, scaled to "
+        "sim mean team score) — not season per-game averages.",
         "Tags: HOT/COLD = recent form; quarter edges = Q1-Q4 tendency matchup; "
         "clutch Q4 = close-game weighting.",
         "",
@@ -293,8 +432,9 @@ def format_ai_paste_markdown(target_date: str, predictions: list[dict[str, Any]]
         "## AI paste context",
         "",
         "_Copy everything under this heading into another AI for wager ideas. "
-        "Includes season win rate, average combined score, and top-3 players "
-        "in PTS / REB / AST / STL / BLK._",
+        "Includes season win rate / avg combined score (context) and top-3 "
+        "players by **projected this game** PTS / REB / AST / STL / BLK "
+        "(sim mean — not season per-game)._",
         "",
         f"Slate date: **{target_date}**",
         "",

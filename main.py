@@ -141,8 +141,10 @@ def _print_team_season(season: dict) -> None:
     w, l = season.get("wins"), season.get("losses")
     win_s = f"{win_pct:.1f}% ({w}-{l})" if win_pct is not None else "n/a"
     tot_s = f"{avg_total:.1f}" if avg_total is not None else "n/a"
-    print(f"      {abbr}: win {win_s}  avg total {tot_s}")
+    print(f"      {abbr}: season win {win_s}  season avg total {tot_s}")
     tops = season.get("top_players") or {}
+    if tops:
+        print("        Top 3 (projected this game, sim mean):")
     for stat, title in (
         ("PTS", "PTS"),
         ("REB", "REB"),
