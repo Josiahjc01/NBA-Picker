@@ -27,8 +27,29 @@ EARLY_SEASON_GAMES = int(os.getenv("EARLY_SEASON_GAMES", "10"))
 
 # Hot/cold form (last-N vs season EWM)
 FORM_LAST_N = int(os.getenv("FORM_LAST_N", "5"))
+FORM_L10_N = int(os.getenv("FORM_L10_N", "10"))
 FORM_EDGE_CAP = float(os.getenv("FORM_EDGE_CAP", "3.0"))
 FORM_PLAYER_PTS_DELTA = float(os.getenv("FORM_PLAYER_PTS_DELTA", "4.0"))
+# Multi-horizon blend weights into form_edge (L5 / L10 / season residual)
+FORM_W_L5 = float(os.getenv("FORM_W_L5", "0.45"))
+FORM_W_L10 = float(os.getenv("FORM_W_L10", "0.35"))
+FORM_W_SEASON = float(os.getenv("FORM_W_SEASON", "0.20"))
+
+# Recent minutes / usage for projections (injury still wins)
+MINUTES_LAST_N = int(os.getenv("MINUTES_LAST_N", "8"))
+MINUTES_RECENT_WEIGHT = float(os.getenv("MINUTES_RECENT_WEIGHT", "0.65"))
+
+# Opponent-adjusted (SRS-style) iterations
+SRS_ITERATIONS = int(os.getenv("SRS_ITERATIONS", "10"))
+SRS_BLEND = float(os.getenv("SRS_BLEND", "0.55"))  # how much SRS net replaces raw net
+
+# Allowed Monte Carlo sim counts (GUI + CLI)
+SIM_COUNT_CHOICES = (5000, 10000, 25000, 50000)
+
+# Denver altitude residual (points / pace)
+ALTITUDE_HOME_POINTS = float(os.getenv("ALTITUDE_HOME_POINTS", "1.4"))
+ALTITUDE_PACE_BONUS = float(os.getenv("ALTITUDE_PACE_BONUS", "1.0"))
+ALTITUDE_TEAMS = frozenset({"DEN"})
 
 # Quarter tendency matchup residual (points, shrunk)
 QUARTER_EDGE_CAP = float(os.getenv("QUARTER_EDGE_CAP", "1.5"))

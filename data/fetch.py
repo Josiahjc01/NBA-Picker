@@ -235,6 +235,31 @@ def fetch_prior_season_logs(force: bool = False) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def fetch_prior_espn_seed(force: bool = False) -> pd.DataFrame:
+    """
+    Prior-season team rating seed from ESPN (works when nba_api is blocked).
+    season_end_year = current_season_year (e.g. 2026 for 2025-26 when now is 2026-27).
+    """
+    end_year = config.current_season_year()  # ending year of prior season
+    key = f"prior_espn_seed_{end_year}"
+
+    def _fetch():
+        from data import espn
+
+        rows = espn.team_season_stats_for_year(end_year)
+        if not rows:
+            raise RuntimeError("Empty ESPN prior season stats")
+        logger.info("Prior ESPN seed for %s (%d teams)", end_year, len(rows))
+        return rows
+
+    try:
+        rows = load_or_fetch_json(key, _fetch, force=force, max_age_hours=48.0)
+        return pd.DataFrame(rows or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Prior ESPN seed failed: %s", exc)
+        return pd.DataFrame()
+
+
 def _league_dash_team(season: str, measure: str = "Base") -> list[dict[str, Any]]:
     from nba_api.stats.endpoints import leaguedashteamstats
 
@@ -809,6 +834,165 @@ def fetch_quarter_logs(force: bool = False) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _slate_teams(games: list[dict[str, Any]]) -> set[str]:
+    teams = {
+        normalize_abbrev(g.get("home_abbr")) for g in games or []
+    } | {
+        normalize_abbrev(g.get("away_abbr")) for g in games or []
+    }
+    teams.discard("")
+    return teams
+
+
+def _athlete_gamelog_cached(
+    athlete_id: str,
+    *,
+    last_n: int,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    """Shared ESPN gamelog cache (enough rows for minutes + form)."""
+    season_end = config.current_season_year() + 1
+    n = max(last_n, config.MINUTES_LAST_N, config.FORM_L10_N, config.FORM_LAST_N)
+    cache_key = f"player_gamelog_{athlete_id}_{season_end}_n{n}"
+
+    def _fetch(aid=athlete_id, take=n):
+        from data import espn
+
+        return espn.player_gamelog_recent(
+            aid,
+            season_end_year=season_end,
+            last_n=take,
+        )
+
+    try:
+        return load_or_fetch_json(cache_key, _fetch, force=force, max_age_hours=8.0) or []
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Gamelog %s failed: %s", athlete_id, exc)
+        return []
+
+
+def fetch_recent_player_minutes(
+    games: list[dict[str, Any]],
+    rosters: list[dict[str, Any]],
+    players: pd.DataFrame | None,
+    force: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """
+    Last-N minutes + FGA usage for slate rotation players (ESPN gamelogs).
+    Keyed by normalized player name.
+    """
+    slate_teams = _slate_teams(games)
+    if not slate_teams:
+        return {}
+
+    id_by_name: dict[str, str] = {}
+    team_by_name: dict[str, str] = {}
+    display_by_name: dict[str, str] = {}
+    for r in rosters or []:
+        raw_name = str(r.get("PLAYER_NAME") or "").strip()
+        name = re.sub(r"\s+", " ", raw_name).lower()
+        pid = str(r.get("PLAYER_ID") or "").strip()
+        abbr = normalize_abbrev(str(r.get("TEAM_ABBREVIATION") or ""))
+        if name and pid and abbr in slate_teams:
+            id_by_name[name] = pid
+            team_by_name[name] = abbr
+            display_by_name[name] = raw_name
+
+    season_min: dict[str, float] = {}
+    if players is not None and not players.empty:
+        name_c = next((c for c in ("PLAYER_NAME", "player") if c in players.columns), None)
+        team_c = next((c for c in ("TEAM_ABBREVIATION", "team") if c in players.columns), None)
+        min_c = next((c for c in ("MIN", "minutes") if c in players.columns), None)
+        if name_c and team_c and min_c:
+            for _, row in players.iterrows():
+                abbr = normalize_abbrev(str(row.get(team_c) or ""))
+                if abbr not in slate_teams:
+                    continue
+                key = re.sub(r"\s+", " ", str(row.get(name_c) or "").strip()).lower()
+                try:
+                    season_min[key] = float(row.get(min_c))
+                except (TypeError, ValueError):
+                    pass
+
+    out: dict[str, dict[str, Any]] = {}
+    for team in slate_teams:
+        ranked = sorted(
+            (
+                (n, season_min.get(n, 0.0))
+                for n, t in team_by_name.items()
+                if t == team and n in id_by_name
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        for name, _sm in ranked[:12]:
+            recent = _athlete_gamelog_cached(
+                id_by_name[name],
+                last_n=config.MINUTES_LAST_N,
+                force=force,
+            )
+            if not recent:
+                continue
+            mins = [
+                float(r["minutes"])
+                for r in recent[: config.MINUTES_LAST_N]
+                if r.get("minutes") is not None
+            ]
+            fgas = [
+                float(r["fga"])
+                for r in recent[: config.MINUTES_LAST_N]
+                if r.get("fga") is not None
+            ]
+            if len(mins) < 2:
+                continue
+            avg_min = float(np.mean(mins))
+            avg_fga = float(np.mean(fgas)) if fgas else None
+            usage = None
+            if avg_fga is not None and avg_min > 0:
+                usage = avg_fga / max(avg_min, 1.0) * 36.0  # FGA per 36
+            out[name] = {
+                "player": display_by_name.get(name, name.title()),
+                "team": team,
+                "recent_minutes": round(avg_min, 1),
+                "season_minutes": round(float(season_min.get(name) or 0.0), 1),
+                "usage_fga36": round(usage, 2) if usage is not None else None,
+                "n": len(mins),
+            }
+    logger.info("Recent minutes profiles: %d slate players", len(out))
+    return out
+
+
+def fetch_game_day_injuries(
+    games: list[dict[str, Any]],
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    """Day-of inactives / injury statuses from ESPN game summaries."""
+    from data import espn
+
+    out: list[dict[str, Any]] = []
+    for g in games or []:
+        gid = str(g.get("game_id") or "")
+        if not gid:
+            continue
+        key = f"gameday_injuries_{gid}"
+
+        def _fetch(event_id=gid):
+            return espn.game_day_injuries(event_id)
+
+        try:
+            rows = load_or_fetch_json(
+                key,
+                _fetch,
+                force=force,
+                max_age_hours=1.0,
+            ) or []
+            out.extend(rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Game-day injuries %s failed: %s", gid, exc)
+    logger.info("Game-day injury rows: %d", len(out))
+    return out
+
+
 def fetch_player_form(
     games: list[dict[str, Any]],
     rosters: list[dict[str, Any]],
@@ -819,18 +1003,10 @@ def fetch_player_form(
     Hot/cold for key rotation players on tonight's slate teams.
     Compares last-N PTS to season average (ESPN athlete gamelog).
     """
-    slate_teams = {
-        normalize_abbrev(g.get("home_abbr"))
-        for g in games or []
-    } | {
-        normalize_abbrev(g.get("away_abbr"))
-        for g in games or []
-    }
-    slate_teams.discard("")
+    slate_teams = _slate_teams(games)
     if not slate_teams:
         return {}
 
-    # Map name -> espn athlete id from roster
     id_by_name: dict[str, str] = {}
     team_by_name: dict[str, str] = {}
     for r in rosters or []:
@@ -841,7 +1017,6 @@ def fetch_player_form(
             id_by_name[name] = pid
             team_by_name[name] = abbr
 
-    # Season PTS / minutes for slate teams
     season_pts: dict[str, float] = {}
     season_min: dict[str, float] = {}
     if players is not None and not players.empty:
@@ -866,8 +1041,7 @@ def fetch_player_form(
                     except (TypeError, ValueError):
                         pass
 
-    # Top rotation names per slate team (by season minutes)
-    candidates: list[tuple[str, str, str]] = []  # name, team, athlete_id
+    candidates: list[tuple[str, str, str]] = []
     for team in slate_teams:
         team_names = [
             (n, season_min.get(n, 0.0))
@@ -880,33 +1054,20 @@ def fetch_player_form(
                 continue
             candidates.append((name, team, id_by_name[name]))
 
-    season_end = config.current_season_year() + 1
     out: dict[str, dict[str, Any]] = {}
-    from data import espn
-
     for name, team, athlete_id in candidates:
-        cache_key = f"player_form_{athlete_id}_{season_end}"
-
-        def _fetch(aid=athlete_id):
-            return espn.player_gamelog_recent(
-                aid,
-                season_end_year=season_end,
-                last_n=config.FORM_LAST_N,
-            )
-
-        try:
-            recent = load_or_fetch_json(
-                cache_key,
-                _fetch,
-                force=force,
-                max_age_hours=8.0,
-            ) or []
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Player form %s failed: %s", name, exc)
-            continue
+        recent = _athlete_gamelog_cached(
+            athlete_id,
+            last_n=config.FORM_LAST_N,
+            force=force,
+        )
         if len(recent) < 3:
             continue
-        recent_pts = [float(r["pts"]) for r in recent if r.get("pts") is not None]
+        recent_pts = [
+            float(r["pts"])
+            for r in recent[: config.FORM_LAST_N]
+            if r.get("pts") is not None
+        ]
         if not recent_pts:
             continue
         avg_recent = float(np.mean(recent_pts))
@@ -952,14 +1113,27 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     games = fetch_games_for_date(target_date, force=force)
     team_logs = fetch_team_game_logs(force=force)
     prior_logs = fetch_prior_season_logs(force=force)
+    prior_espn = fetch_prior_espn_seed(force=force)
     team_adv = fetch_team_advanced(force=force)
     four_factors = fetch_team_four_factors(force=force)
     rosters = fetch_rosters(force=force)
     players = fetch_player_stats(force=force)
     play_types = fetch_play_types(force=force)
     injuries = fetch_injuries(force=force)
+    gameday_injuries = fetch_game_day_injuries(games, force=force)
+    # Day-of statuses override league injury board when present
+    if gameday_injuries:
+        by_player = {
+            re.sub(r"\s+", " ", str(r.get("player") or "").strip()).lower(): r
+            for r in injuries
+        }
+        for row in gameday_injuries:
+            key = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
+            by_player[key] = row
+        injuries = list(by_player.values())
     impact = fetch_player_impact(force=force)
     quarter_logs = fetch_quarter_logs(force=force)
+    recent_minutes = fetch_recent_player_minutes(games, rosters, players, force=force)
     player_form = fetch_player_form(games, rosters, players, force=force)
 
     bundle = {
@@ -969,10 +1143,13 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "team_logs_rows": len(team_logs),
         "roster_count": len(rosters),
         "injuries_count": len(injuries),
+        "gameday_injuries_count": len(gameday_injuries),
         "impact_count": len(impact),
         "player_stats_rows": int(len(players)) if players is not None else 0,
         "quarter_log_rows": int(len(quarter_logs)) if quarter_logs is not None else 0,
+        "recent_minutes_players": len(recent_minutes),
         "player_form_tags": len(player_form),
+        "prior_espn_rows": int(len(prior_espn)) if prior_espn is not None else 0,
         "roster_fp": (read_cache_meta("rosters_current") or {}).get("fingerprint"),
         "injury_fp": (read_cache_meta("injuries_v2") or {}).get("fingerprint"),
     }
@@ -982,14 +1159,17 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "games": games,
         "team_logs": team_logs,
         "prior_logs": prior_logs,
+        "prior_espn": prior_espn,
         "team_adv": team_adv,
         "four_factors": four_factors,
         "rosters": rosters,
         "players": players,
         "play_types": play_types,
         "injuries": injuries,
+        "gameday_injuries": gameday_injuries,
         "impact": impact,
         "quarter_logs": quarter_logs,
+        "recent_minutes": recent_minutes,
         "player_form": player_form,
         "meta": bundle,
     }

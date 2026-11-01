@@ -46,6 +46,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--away", default=None, help="Away team abbr (with --home filters one matchup)")
     p.add_argument("--home", default=None, help="Home team abbr (with --away filters one matchup)")
+    p.add_argument(
+        "--sims",
+        type=int,
+        default=None,
+        choices=list(config.SIM_COUNT_CHOICES),
+        help=f"Monte Carlo sims per game (default {config.SIM_COUNT}; "
+        f"choices: {', '.join(str(c) for c in config.SIM_COUNT_CHOICES)})",
+    )
     return p.parse_args(argv)
 
 
@@ -263,6 +271,7 @@ def run_pipeline(
     team_filter: set[str] | None = None,
     matchup: tuple[str, str] | None = None,
     write_outputs: bool = True,
+    sim_count: int | None = None,
 ) -> dict:
     """
     Core pipeline used by CLI and GUI.
@@ -272,13 +281,17 @@ def run_pipeline(
 
     ``matchup`` is ``(away_abbr, home_abbr)`` and takes precedence over
     ``team_filter`` when set.
+    ``sim_count`` overrides Monte Carlo runs (5000 / 10000 / 25000 / 50000).
     """
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     raw = fetch_all(target, force=force)
     features = build_features(raw, target)
-    predictions = enrich_predictions_with_brief(predict_slate(features), features)
+    predictions = enrich_predictions_with_brief(
+        predict_slate(features, sim_count=sim_count),
+        features,
+    )
 
     personnel = None
     if matchup:
@@ -303,11 +316,14 @@ def run_pipeline(
     meta = raw.get("meta") or {}
     if personnel:
         meta = {**meta, "personnel_verify": personnel}
+    nsim = sim_count if sim_count is not None else config.SIM_COUNT
+    meta = {**meta, "sim_count": nsim}
     ai_paste = format_ai_paste(target.isoformat(), predictions)
     payload = {
         "date": target.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "meta": meta,
+        "sim_count": nsim,
         "predictions": predictions,
         "ai_paste": ai_paste,
         "personnel_verify": personnel,
@@ -328,8 +344,11 @@ def run(
     force: bool = False,
     *,
     matchup: tuple[str, str] | None = None,
+    sim_count: int | None = None,
 ) -> int:
-    payload = run_pipeline(target, force=force, matchup=matchup)
+    payload = run_pipeline(
+        target, force=force, matchup=matchup, sim_count=sim_count
+    )
     predictions = payload["predictions"]
     print_terminal(
         target,
@@ -366,7 +385,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         matchup = (args.away.upper(), args.home.upper())
     try:
-        return run(target, force=args.force_refresh, matchup=matchup)
+        return run(
+            target,
+            force=args.force_refresh,
+            matchup=matchup,
+            sim_count=args.sims,
+        )
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
         return 130

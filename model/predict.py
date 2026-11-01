@@ -14,6 +14,7 @@ from data.process import (
     home_road_matchup_residual,
     playtype_matchup_residual,
     quarter_matchup_residual,
+    shot_profile_residual,
 )
 from data.static_arenas import normalize_abbrev
 
@@ -127,10 +128,18 @@ def _mean_scores(
     a_off = float(np.clip(ar["off_rtg"], 98.0, 125.0))
     a_def = float(np.clip(ar["def_rtg"], 98.0, 125.0))
 
-    # Four-factors soft nudge (scaled by sample trust)
+    # Four-factors soft nudge (scaled by sample trust) — eFG, TOV, ORB, FT rate
     ff = 0.35 + 0.65 * w_sample
-    h_off += ff * (12.0 * (float(hr["efg"]) - 0.53) - 25.0 * (float(hr["tov_pct"]) - 0.13))
-    a_off += ff * (12.0 * (float(ar["efg"]) - 0.53) - 25.0 * (float(ar["tov_pct"]) - 0.13))
+    def _ff_off(row: dict[str, float]) -> float:
+        return (
+            12.0 * (float(row["efg"]) - 0.53)
+            - 25.0 * (float(row["tov_pct"]) - 0.13)
+            + 8.0 * (float(row.get("orb_pct") or 0.28) - 0.28)
+            + 6.0 * (float(row.get("ft_rate") or 0.25) - 0.25)
+        )
+
+    h_off += ff * _ff_off(hr)
+    a_off += ff * _ff_off(ar)
 
     # Injury-first: full injury_delta; talent residual heavily shrunk
     h_inj = _finite(hi.get("injury_delta"))
@@ -167,15 +176,15 @@ def _mean_scores(
     )
     away_pts += _finite(a_ctx.get("context_points"), 0.0)
 
-    # Hot/cold team form (shrunk further early season)
+    # Multi-horizon form residual (ratings already absorbed part of form_edge)
     form = features.get("team_form") or {}
     h_form = form.get(home) or {}
     a_form = form.get(away) or {}
-    form_scale = 0.55 + 0.45 * w_sample
+    form_scale = 0.35 + 0.30 * w_sample
     h_form_edge = form_scale * _finite(h_form.get("form_edge"))
     a_form_edge = form_scale * _finite(a_form.get("form_edge"))
-    home_pts += 0.55 * h_form_edge
-    away_pts += 0.55 * a_form_edge
+    home_pts += 0.40 * h_form_edge
+    away_pts += 0.40 * a_form_edge
 
     # Key player hot/cold (small nudge; notes carry the signal)
     player_form = features.get("player_form") or {}
@@ -204,8 +213,11 @@ def _mean_scores(
     hr_edge, hr_notes = home_road_matchup_residual(
         features.get("home_road") or {}, home, away
     )
-    matchup_edge += hr_edge
-    matchup_notes = list(matchup_notes) + list(hr_notes)
+    shot_edge, shot_notes = shot_profile_residual(
+        features.get("team_adv"), home, away
+    )
+    matchup_edge += hr_edge + shot_edge
+    matchup_notes = list(matchup_notes) + list(hr_notes) + list(shot_notes)
 
     # Preliminary margin for clutch/Q4 decision (before quarter residual)
     prelim_margin = home_pts - away_pts
@@ -267,6 +279,17 @@ def _mean_scores(
     return home_pts, away_pts, meta
 
 
+def _normalize_sim_count(n: int | None) -> int:
+    """Clamp to allowed GUI/CLI choices; default SIM_COUNT."""
+    if n is None:
+        return int(config.SIM_COUNT)
+    n = int(n)
+    if n in config.SIM_COUNT_CHOICES:
+        return n
+    # Nearest allowed choice
+    return min(config.SIM_COUNT_CHOICES, key=lambda c: abs(c - n))
+
+
 def simulate_game(
     mean_home: float,
     mean_away: float,
@@ -278,7 +301,7 @@ def simulate_game(
     Vectorized Monte Carlo: correlated score noise around mean projections.
     Returns win rates + score distribution summaries (not extra scrapes).
     """
-    n = int(n if n is not None else config.SIM_COUNT)
+    n = _normalize_sim_count(n)
     n = max(100, n)
     rng = np.random.default_rng(seed)
     sig = config.SCORE_SIGMA
@@ -322,7 +345,12 @@ def simulate_game(
     }
 
 
-def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, Any]:
+def project_game(
+    game: dict[str, Any],
+    features: dict[str, Any],
+    *,
+    sim_count: int | None = None,
+) -> dict[str, Any]:
     home_pts, away_pts, meta = _mean_scores(game, features)
     home = meta["home"]
     away = meta["away"]
@@ -332,7 +360,7 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
     # Deterministic seed from game_id for stable re-runs
     gid = str(game.get("game_id") or f"{away}{home}{game.get('game_date')}")
     seed = abs(hash(gid)) % (2**32 - 1)
-    sims = simulate_game(home_pts, away_pts, seed=seed)
+    sims = simulate_game(home_pts, away_pts, n=sim_count, seed=seed)
 
     # Prefer sim win% ; mean scores from sims (close to analytic means)
     win_p = sims["home_win_prob"]
@@ -418,12 +446,16 @@ def project_game(game: dict[str, Any], features: dict[str, Any]) -> dict[str, An
     }
 
 
-def predict_slate(features: dict[str, Any]) -> list[dict[str, Any]]:
+def predict_slate(
+    features: dict[str, Any],
+    *,
+    sim_count: int | None = None,
+) -> list[dict[str, Any]]:
     games = features.get("games") or []
     preds = []
     for g in games:
         try:
-            preds.append(project_game(g, features))
+            preds.append(project_game(g, features, sim_count=sim_count))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Prediction failed for %s: %s", g.get("game_id"), exc)
     return preds

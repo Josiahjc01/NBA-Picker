@@ -359,10 +359,11 @@ def build_team_form(
     last_n: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
-    Hot/cold from last-N net margin / scoring vs season averages.
-    Returns per-team form_edge (points, capped) + notes when material.
+    Multi-horizon form: blend L5 / L10 / season margin gaps into form_edge.
+    Also tags HOT/COLD when material. Returns per-team form_edge (capped).
     """
     last_n = last_n or config.FORM_LAST_N
+    l10_n = config.FORM_L10_N
     out: dict[str, dict[str, Any]] = {}
     if team_logs is None or (isinstance(team_logs, pd.DataFrame) and team_logs.empty):
         return out
@@ -394,24 +395,36 @@ def build_team_form(
     else:
         df["_pm"] = np.nan
 
+    def _avg_pm(frame: pd.DataFrame) -> float:
+        if frame.empty or not frame["_pm"].notna().any():
+            return 0.0
+        return float(frame["_pm"].mean())
+
     for abbr, g in df.groupby("_abbr"):
         g = g.dropna(subset=["_pts"]).sort_values("_date")
         if len(g) < 3:
             continue
-        season_margin = float(g["_pm"].mean()) if g["_pm"].notna().any() else 0.0
+        season_margin = _avg_pm(g)
         season_pts = float(g["_pts"].mean())
-        recent = g.tail(last_n)
-        recent_margin = float(recent["_pm"].mean()) if recent["_pm"].notna().any() else season_margin
-        recent_pts = float(recent["_pts"].mean())
-        # Form signal: margin gap + mild scoring gap (offense heat)
-        margin_gap = recent_margin - season_margin
-        pts_gap = recent_pts - season_pts
-        raw = 0.55 * margin_gap + 0.20 * pts_gap
+        l5 = g.tail(last_n)
+        l10 = g.tail(l10_n)
+        l5_margin = _avg_pm(l5)
+        l10_margin = _avg_pm(l10)
+        l5_pts = float(l5["_pts"].mean())
+        l10_pts = float(l10["_pts"].mean())
+
+        # Residuals vs season; season term keeps mild regression toward 0
+        r5 = 0.55 * (l5_margin - season_margin) + 0.20 * (l5_pts - season_pts)
+        r10 = 0.55 * (l10_margin - season_margin) + 0.15 * (l10_pts - season_pts)
+        r_szn = 0.15 * season_margin  # weak season-level net pull into form
+        w5, w10, wsz = config.FORM_W_L5, config.FORM_W_L10, config.FORM_W_SEASON
+        wsum = max(w5 + w10 + wsz, 1e-6)
+        raw = (w5 * r5 + w10 * r10 + wsz * r_szn) / wsum
         edge = float(np.clip(raw, -config.FORM_EDGE_CAP, config.FORM_EDGE_CAP))
-        # Streak: consecutive W/L at end of log
+
         streak = 0
-        if plus_c and recent["_pm"].notna().any():
-            signs = list(recent["_pm"].dropna().map(lambda x: 1 if x > 0 else -1))
+        if plus_c and l5["_pm"].notna().any():
+            signs = list(l5["_pm"].dropna().map(lambda x: 1 if x > 0 else -1))
             if signs:
                 streak = signs[-1]
                 for s in reversed(signs[:-1]):
@@ -422,7 +435,6 @@ def build_team_form(
         tag = "NEUTRAL"
         if edge >= 1.25 or streak >= 3:
             tag = "HOT"
-            # Streak-only heat still moves the needle a little
             if edge < 1.25:
                 edge = max(edge, min(1.5, 0.45 * abs(streak)))
         elif edge <= -1.25 or streak <= -3:
@@ -431,25 +443,196 @@ def build_team_form(
                 edge = min(edge, -min(1.5, 0.45 * abs(streak)))
         edge = float(np.clip(edge, -config.FORM_EDGE_CAP, config.FORM_EDGE_CAP))
         note = None
-        if tag != "NEUTRAL":
+        if tag != "NEUTRAL" or abs(edge) >= 1.0:
             note = (
-                f"{abbr} {tag}: last {len(recent)}g margin {recent_margin:+.1f} "
-                f"(szn {season_margin:+.1f}), pts {recent_pts:.1f}"
+                f"{abbr} {tag if tag != 'NEUTRAL' else 'FORM'}: "
+                f"L{len(l5)} {l5_margin:+.1f} / L{len(l10)} {l10_margin:+.1f} / "
+                f"szn {season_margin:+.1f} -> edge {edge:+.1f}"
                 + (f", streak {streak:+d}" if abs(streak) >= 3 else "")
             )
         out[str(abbr)] = {
             "team": abbr,
             "tag": tag,
             "form_edge": round(edge, 2),
-            "recent_margin": round(recent_margin, 2),
+            "l5_margin": round(l5_margin, 2),
+            "l10_margin": round(l10_margin, 2),
+            "recent_margin": round(l5_margin, 2),
             "season_margin": round(season_margin, 2),
-            "recent_pts": round(recent_pts, 1),
+            "recent_pts": round(l5_pts, 1),
             "season_pts": round(season_pts, 1),
             "streak": int(streak),
-            "n": int(len(recent)),
+            "n": int(len(l5)),
+            "n10": int(len(l10)),
             "note": note,
         }
     return out
+
+
+def compute_srs_ratings(
+    team_logs: pd.DataFrame,
+    *,
+    iterations: int | None = None,
+) -> dict[str, float]:
+    """
+    Iterative SRS-style schedule-strength adjusted margin ratings.
+    Returns team -> SRS points (approx expected margin vs average team).
+    """
+    iterations = iterations if iterations is not None else config.SRS_ITERATIONS
+    if team_logs is None or (isinstance(team_logs, pd.DataFrame) and team_logs.empty):
+        return {}
+
+    df = team_logs.copy()
+    colmap = {c.upper(): c for c in df.columns}
+    team_c = colmap.get("TEAM_ABBREVIATION") or (
+        "TEAM_ABBREVIATION" if "TEAM_ABBREVIATION" in df.columns else None
+    )
+    date_c = colmap.get("GAME_DATE") or ("GAME_DATE" if "GAME_DATE" in df.columns else None)
+    plus_c = colmap.get("PLUS_MINUS") or ("PLUS_MINUS" if "PLUS_MINUS" in df.columns else None)
+    match_c = colmap.get("MATCHUP") or ("MATCHUP" if "MATCHUP" in df.columns else None)
+    if not team_c or not plus_c:
+        return {}
+
+    df["_abbr"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
+    df["_pm"] = pd.to_numeric(df[plus_c], errors="coerce")
+    if date_c:
+        df["_date"] = df[date_c].apply(_parse_game_date)
+        df = df.dropna(subset=["_date", "_pm"])
+    else:
+        df = df.dropna(subset=["_pm"])
+
+    # Infer opponent from MATCHUP when possible
+    def _opp(row: pd.Series) -> str:
+        if not match_c or not isinstance(row.get(match_c), str):
+            return ""
+        m = str(row[match_c])
+        parts = re.split(r"\s+(@|vs\.?)\s+", m, flags=re.I)
+        tokens = [normalize_abbrev(t) for t in re.findall(r"[A-Za-z]{2,3}", m)]
+        me = row["_abbr"]
+        for t in tokens:
+            if t and t != me and t in {normalize_abbrev(x) for x in df["_abbr"].unique()}:
+                return t
+        return ""
+
+    df["_opp"] = df.apply(_opp, axis=1)
+    teams = sorted({a for a in df["_abbr"].unique() if a})
+    if not teams:
+        return {}
+
+    # Seed with average margin
+    srs = {t: float(df.loc[df["_abbr"] == t, "_pm"].mean()) for t in teams}
+    for _ in range(max(1, iterations)):
+        nxt: dict[str, float] = {}
+        for t in teams:
+            g = df[df["_abbr"] == t]
+            vals = []
+            for _, r in g.iterrows():
+                opp = r["_opp"]
+                opp_r = srs.get(opp, 0.0) if opp else 0.0
+                vals.append(float(r["_pm"]) + opp_r)
+            nxt[t] = float(np.mean(vals)) if vals else 0.0
+        # Center to league mean 0
+        mean_r = float(np.mean(list(nxt.values()))) if nxt else 0.0
+        srs = {t: v - mean_r for t, v in nxt.items()}
+    return srs
+
+
+def apply_srs_to_ratings(
+    ratings: pd.DataFrame,
+    srs: dict[str, float],
+    *,
+    blend: float | None = None,
+) -> pd.DataFrame:
+    """Blend SRS net into team off/def so soft schedules don't inflate raw ratings."""
+    if ratings is None or ratings.empty or not srs:
+        return ratings
+    blend = config.SRS_BLEND if blend is None else blend
+    out = ratings.copy()
+    for i, row in out.iterrows():
+        team = normalize_abbrev(str(row.get("team") or ""))
+        if team not in srs:
+            continue
+        raw_net = float(row.get("net_rtg") or (float(row.get("off_rtg", 0)) - float(row.get("def_rtg", 0))))
+        adj_net = (1.0 - blend) * raw_net + blend * float(srs[team])
+        delta = adj_net - raw_net
+        out.at[i, "off_rtg"] = float(row["off_rtg"]) + 0.55 * delta
+        out.at[i, "def_rtg"] = float(row["def_rtg"]) - 0.45 * delta
+        out.at[i, "net_rtg"] = float(out.at[i, "off_rtg"]) - float(out.at[i, "def_rtg"])
+        out.at[i, "srs"] = float(srs[team])
+    return out
+
+
+def apply_form_to_ratings(
+    ratings: pd.DataFrame,
+    team_form: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    """Fold multi-horizon form_edge into off/def (moderate; predict also uses notes)."""
+    if ratings is None or ratings.empty or not team_form:
+        return ratings
+    out = ratings.copy()
+    for i, row in out.iterrows():
+        team = normalize_abbrev(str(row.get("team") or ""))
+        edge = float((team_form.get(team) or {}).get("form_edge") or 0.0)
+        if abs(edge) < 0.25:
+            continue
+        # Half of form already applied here; predict still uses a shrunk residual
+        bump = 0.35 * edge
+        out.at[i, "off_rtg"] = float(row["off_rtg"]) + 0.6 * bump
+        out.at[i, "def_rtg"] = float(row["def_rtg"]) - 0.4 * bump
+        out.at[i, "net_rtg"] = float(out.at[i, "off_rtg"]) - float(out.at[i, "def_rtg"])
+    return out
+
+
+def shot_profile_residual(
+    team_adv: pd.DataFrame | None,
+    home: str,
+    away: str,
+) -> tuple[float, list[str]]:
+    """
+    Light 3PT-volume residual from ESPN season averages when Synergy is thin.
+    Heavy shrinkage; ASCII notes.
+    """
+    if team_adv is None or (isinstance(team_adv, pd.DataFrame) and team_adv.empty):
+        return 0.0, []
+    df = team_adv.copy()
+    team_c = next(
+        (c for c in ("TEAM_ABBREVIATION", "team", "TEAM") if c in df.columns),
+        None,
+    )
+    if not team_c:
+        return 0.0, []
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+
+    def _row(abbr: str) -> dict[str, Any] | None:
+        hit = df[df[team_c].map(lambda x: normalize_abbrev(str(x))) == abbr]
+        if hit.empty:
+            return None
+        return hit.iloc[0].to_dict()
+
+    hr, ar = _row(home), _row(away)
+    if not hr or not ar:
+        return 0.0, []
+
+    def _fga3(row: dict[str, Any]) -> float | None:
+        for k in ("AVG_FG3A", "avgThreePointFieldGoalsAttempted", "FG3A"):
+            if k in row and row[k] is not None:
+                try:
+                    return float(row[k])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    h3, a3 = _fga3(hr), _fga3(ar)
+    if h3 is None or a3 is None:
+        return 0.0, []
+    league = 37.0  # typical team 3PA/g
+    # High-volume 3PT offense vs low-volume opponent slight pace/variance edge — tiny
+    edge = 0.04 * ((h3 - league) - (a3 - league))
+    edge = float(np.clip(edge, -0.8, 0.8))
+    notes = []
+    if abs(h3 - a3) >= 6.0:
+        notes.append(f"3PA/g: {home} {h3:.1f} vs {away} {a3:.1f}")
+    return edge, notes
 
 
 def build_home_road_splits(team_logs: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -687,8 +870,12 @@ def _match_injury(
 def project_player_minutes(
     players: pd.DataFrame,
     injuries: dict[str, dict[str, Any]],
+    recent_minutes: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    """Season / recent minutes × injury factor (injuries win)."""
+    """
+    Projected minutes = blend(last-N minutes, season) × injury factor.
+    Injury / day-of inactive always wins (factor 0 for Out).
+    """
     if players is None or players.empty:
         return pd.DataFrame(columns=["player", "team", "proj_minutes", "impact", "adj_minutes"])
 
@@ -699,21 +886,48 @@ def project_player_minutes(
     if not name_c:
         return pd.DataFrame()
 
+    recent_minutes = recent_minutes or {}
+    w_recent = float(np.clip(config.MINUTES_RECENT_WEIGHT, 0.0, 1.0))
     rows = []
     for _, r in df.iterrows():
         name = str(r.get(name_c))
+        key = _norm_name(name)
         team = normalize_abbrev(str(r.get(team_c, ""))) if team_c else ""
-        mins = float(pd.to_numeric(r.get(min_c), errors="coerce") or 0.0) if min_c else 0.0
-        # Inactive / G-League two-ways with no minutes stay at 0
+        season_mins = float(pd.to_numeric(r.get(min_c), errors="coerce") or 0.0) if min_c else 0.0
+        rec = recent_minutes.get(key) or {}
+        recent_mins = rec.get("recent_minutes")
+        try:
+            recent_mins_f = float(recent_mins) if recent_mins is not None else None
+        except (TypeError, ValueError):
+            recent_mins_f = None
+        if recent_mins_f is not None and recent_mins_f > 0:
+            mins = w_recent * recent_mins_f + (1.0 - w_recent) * season_mins
+            minutes_source = "recent+season"
+        else:
+            mins = season_mins
+            minutes_source = "season"
+        # Usage nudge: high FGA/36 slightly protects minutes for stars
+        usage = rec.get("usage_fga36")
+        try:
+            usage_f = float(usage) if usage is not None else None
+        except (TypeError, ValueError):
+            usage_f = None
+        if usage_f is not None and usage_f >= 18.0 and mins >= 20.0:
+            mins = min(mins + 0.8, 40.0)
+
         inj = _match_injury(name, team, injuries)
         factor = inj["minutes_factor"] if inj else 1.0
         rows.append(
             {
                 "player": name,
                 "team": team,
-                "proj_minutes": mins,
+                "proj_minutes": round(mins, 2),
+                "season_minutes": round(season_mins, 2),
+                "recent_minutes": round(recent_mins_f, 2) if recent_mins_f is not None else None,
+                "minutes_source": minutes_source,
+                "usage_fga36": round(usage_f, 2) if usage_f is not None else None,
                 "minutes_factor": factor,
-                "adj_minutes": mins * factor,
+                "adj_minutes": round(mins * factor, 2),
                 "injury_status": (inj or {}).get("status"),
                 "injury_source": (inj or {}).get("source"),
             }
@@ -897,6 +1111,15 @@ def rest_and_travel_context(
                 flags.append("home")
             else:
                 flags.append("away")
+            # Denver altitude: boost home, slight pace up for both
+            if home in config.ALTITUDE_TEAMS:
+                if is_home:
+                    adj += config.ALTITUDE_HOME_POINTS
+                    flags.append("altitude-home")
+                else:
+                    adj -= 0.35 * config.ALTITUDE_HOME_POINTS
+                    flags.append("altitude-away")
+                pace_adj += 0.5 * config.ALTITUDE_PACE_BONUS
             ctx[f"{g.get('game_id')}:{team}"] = {
                 "team": team,
                 "game_id": g.get("game_id"),
@@ -905,7 +1128,7 @@ def rest_and_travel_context(
                 "travel_miles": miles,
                 "tz_shift": tz,
                 "context_points": adj,
-                "pace_adj": float(np.clip(pace_adj, -3.0, 2.0)),
+                "pace_adj": float(np.clip(pace_adj, -3.0, 2.5)),
                 "flags": flags,
             }
     return ctx
@@ -974,6 +1197,9 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
     """Top-level feature builder consumed by the model."""
     team_roll = build_team_rolling(raw.get("team_logs"))
     prior_roll = build_team_rolling(raw.get("prior_logs"))
+    # ESPN prior-season seed when nba_api prior logs are empty
+    if prior_roll is None or prior_roll.empty:
+        prior_roll = _ratings_from_espn_season(raw.get("prior_espn"))
     ratings = blend_with_prior(team_roll, prior_roll)
 
     # Early season / score-only logs: blend in ESPN season averages for FF & pace
@@ -989,9 +1215,19 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
                 n_blend=max(config.PRIOR_BLEND_GAMES, config.EARLY_SEASON_GAMES * 2),
             )
 
+    # Opponent-adjusted (SRS) + multi-horizon form into the rating stack
+    srs = compute_srs_ratings(raw.get("team_logs"))
+    ratings = apply_srs_to_ratings(ratings, srs)
+    team_form = build_team_form(raw.get("team_logs"))
+    ratings = apply_form_to_ratings(ratings, team_form)
+
     players = align_players_to_rosters(raw.get("players"), raw.get("rosters") or [])
     inj_idx = index_injuries(raw.get("injuries") or [])
-    minutes = project_player_minutes(players, inj_idx)
+    minutes = project_player_minutes(
+        players,
+        inj_idx,
+        recent_minutes=raw.get("recent_minutes") or {},
+    )
     impact = team_impact_from_players(minutes, raw.get("impact") or [])
     context = rest_and_travel_context(
         raw.get("games") or [],
@@ -999,7 +1235,6 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         target,
         ratings=ratings,
     )
-    team_form = build_team_form(raw.get("team_logs"))
     home_road = build_home_road_splits(raw.get("team_logs"))
     quarter_profiles = build_quarter_profiles(raw.get("quarter_logs"))
 
@@ -1013,7 +1248,9 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         "player_form": raw.get("player_form") or {},
         "home_road": home_road,
         "quarter_profiles": quarter_profiles,
+        "srs": srs,
         "play_types": raw.get("play_types"),
+        "team_adv": raw.get("team_adv"),
         "games": raw.get("games") or [],
         "team_logs": raw.get("team_logs"),
         "players": players,
