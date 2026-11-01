@@ -462,11 +462,12 @@ class NbaPickerApp(tk.Tk):
                 lines.append(f"  Sims runtime: {elapsed:.2f}s")
             lines.append("")
 
-            lines.append("HIGHLIGHTS  (projected this game - sim mean)")
+            n_hl = int(pred.get("sim_count") or config.SIM_COUNT)
+            lines.append(f"HIGHLIGHTS  (sim max over {n_hl:,} runs)")
             lines.append("-" * 64)
             highlights = pred.get("highlights") or []
             if not highlights:
-                lines.append("  (no projected leaders)")
+                lines.append("  (no sim leaders)")
             else:
                 for h in highlights:
                     title = h.get("title") or HIGHLIGHT_TITLES.get(h.get("stat"), h.get("stat"))
