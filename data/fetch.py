@@ -194,13 +194,19 @@ def _team_game_logs(season: str) -> list[dict[str, Any]]:
     from data import espn
 
     rows = espn.team_game_logs_from_schedules()
-    logger.info("Team logs from ESPN schedules (%d)", len(rows))
+    # Fill FF/pace inputs from ESPN boxscore summaries (free fallback)
+    try:
+        rows = espn.enrich_team_logs_with_boxscores(rows, max_games=90)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ESPN boxscore enrichment failed: %s", exc)
+    logger.info("Team logs from ESPN schedules (+box) (%d)", len(rows))
     return rows
 
 
 def fetch_team_game_logs(season: str | None = None, force: bool = False) -> pd.DataFrame:
     season = season or config.season_string()
-    key = f"team_logs_{season}"
+    # Bump cache key when box enrichment lands so stale score-only logs refresh
+    key = f"team_logs_box_{season}"
 
     def _fetch():
         return _team_game_logs(season)
@@ -787,26 +793,76 @@ def _bpm_proxy_from_nba() -> list[dict[str, Any]]:
 
 
 def fetch_player_impact(force: bool = False) -> list[dict[str, Any]]:
-    key = "player_impact"
+    """
+    Multi-source player prior inventory: blend dunksandthrees / nbarapm / darko
+    / nba_api proxy by normalized name (average when multiple sources hit).
+    """
+    key = "player_impact_blend_v2"
 
     def _fetch():
+        buckets: dict[str, list[float]] = {}
+        meta: dict[str, dict[str, Any]] = {}
         for name, fn in (
             ("dunksandthrees", _scrape_dunksandthrees_epm),
             ("nbarapm", _scrape_nbarapm),
             ("darko", _scrape_darko),
         ):
             try:
-                rows = fn()
-                if rows:
-                    logger.info("Player impact from %s (%d rows)", name, len(rows))
-                    return rows
+                rows = fn() or []
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Impact scrape %s failed: %s", name, exc)
-        proxy = _bpm_proxy_from_nba()
+                rows = []
+            if rows:
+                logger.info("Player impact source %s (%d rows)", name, len(rows))
+            for row in rows:
+                pname = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
+                if not pname:
+                    continue
+                try:
+                    epm = float(row.get("epm"))
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(epm):
+                    continue
+                buckets.setdefault(pname, []).append(epm)
+                meta[pname] = {
+                    "player": row.get("player") or pname.title(),
+                    "sources": list(
+                        dict.fromkeys((meta.get(pname) or {}).get("sources", []) + [name])
+                    ),
+                }
+        proxy = _bpm_proxy_from_nba() or []
         if proxy:
-            logger.warning("Using nba_api z-score proxy for player impact")
-            return proxy
-        return []
+            logger.info("Merging nba_api z-score proxy (%d)", len(proxy))
+        for row in proxy:
+            pname = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
+            if not pname:
+                continue
+            try:
+                epm = float(row.get("epm"))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(epm):
+                continue
+            # Proxy gets half weight via duplicate-average trick: append once
+            buckets.setdefault(pname, []).append(epm)
+            prev = meta.get(pname) or {"player": row.get("player") or pname.title(), "sources": []}
+            prev["sources"] = list(dict.fromkeys(prev.get("sources", []) + ["nba_proxy"]))
+            meta[pname] = prev
+        out = []
+        for pname, vals in buckets.items():
+            m = meta.get(pname) or {"player": pname.title(), "sources": []}
+            out.append(
+                {
+                    "player": m["player"],
+                    "epm": round(float(np.mean(vals)), 3),
+                    "epm_n_sources": len(vals),
+                    "sources": ",".join(m.get("sources") or []),
+                    "source": "blend",
+                }
+            )
+        logger.info("Blended player impact inventory: %d players", len(out))
+        return out
 
     try:
         return load_or_fetch_json(key, _fetch, force=force) or []
@@ -1107,6 +1163,93 @@ def fetch_player_form(
     return out
 
 
+def fetch_player_rate_profiles(
+    games: list[dict[str, Any]],
+    rosters: list[dict[str, Any]],
+    players: pd.DataFrame | None,
+    force: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """
+    L5 / L10 per-game counting rates for slate rotation players (ESPN gamelogs).
+    Used by player_sim generative means (#2).
+    """
+    slate_teams = _slate_teams(games)
+    if not slate_teams:
+        return {}
+
+    id_by_name: dict[str, str] = {}
+    team_by_name: dict[str, str] = {}
+    for r in rosters or []:
+        name = re.sub(r"\s+", " ", str(r.get("PLAYER_NAME") or "").strip()).lower()
+        pid = str(r.get("PLAYER_ID") or "").strip()
+        abbr = normalize_abbrev(str(r.get("TEAM_ABBREVIATION") or ""))
+        if name and pid and abbr in slate_teams:
+            id_by_name[name] = pid
+            team_by_name[name] = abbr
+
+    season_min: dict[str, float] = {}
+    if players is not None and not players.empty:
+        name_c = next((c for c in ("PLAYER_NAME", "player") if c in players.columns), None)
+        team_c = next((c for c in ("TEAM_ABBREVIATION", "team") if c in players.columns), None)
+        min_c = next((c for c in ("MIN", "minutes") if c in players.columns), None)
+        if name_c and team_c and min_c:
+            for _, row in players.iterrows():
+                abbr = normalize_abbrev(str(row.get(team_c) or ""))
+                if abbr not in slate_teams:
+                    continue
+                key = re.sub(r"\s+", " ", str(row.get(name_c) or "").strip()).lower()
+                try:
+                    season_min[key] = float(row.get(min_c))
+                except (TypeError, ValueError):
+                    pass
+
+    stat_keys = ("pts", "reb", "ast", "stl", "blk", "fg3m", "minutes", "fga")
+    out: dict[str, dict[str, Any]] = {}
+    for team in slate_teams:
+        ranked = sorted(
+            (
+                (n, season_min.get(n, 0.0))
+                for n, t in team_by_name.items()
+                if t == team and n in id_by_name
+            ),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        for name, _sm in ranked[:12]:
+            recent = _athlete_gamelog_cached(
+                id_by_name[name],
+                last_n=max(config.FORM_L10_N, 10),
+                force=force,
+            )
+            if len(recent) < 2:
+                continue
+            entry: dict[str, Any] = {"player": name, "team": team, "n": len(recent)}
+            for window, prefix in ((5, "l5"), (10, "l10")):
+                chunk = recent[:window]
+                if not chunk:
+                    continue
+                for sk in ("pts", "reb", "ast", "stl", "blk", "fg3m"):
+                    vals = [
+                        float(r[sk])
+                        for r in chunk
+                        if r.get(sk) is not None
+                    ]
+                    if vals:
+                        # Map to PLAYER_SIM_STATS keys
+                        key = {
+                            "pts": "PTS",
+                            "reb": "REB",
+                            "ast": "AST",
+                            "stl": "STL",
+                            "blk": "BLK",
+                            "fg3m": "FG3M",
+                        }[sk]
+                        entry[f"{prefix}_{key}"] = round(float(np.mean(vals)), 2)
+            out[name] = entry
+    logger.info("Player rate profiles: %d slate players", len(out))
+    return out
+
+
 def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     """Orchestrate all free-source pulls for a target slate."""
     logger.info("Fetching data for %s (force=%s)", target_date, force)
@@ -1121,7 +1264,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     play_types = fetch_play_types(force=force)
     injuries = fetch_injuries(force=force)
     gameday_injuries = fetch_game_day_injuries(games, force=force)
-    # Day-of statuses override league injury board when present
+    # Day-of / tip-time statuses override league injury board when present
     if gameday_injuries:
         by_player = {
             re.sub(r"\s+", " ", str(r.get("player") or "").strip()).lower(): r
@@ -1135,6 +1278,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     quarter_logs = fetch_quarter_logs(force=force)
     recent_minutes = fetch_recent_player_minutes(games, rosters, players, force=force)
     player_form = fetch_player_form(games, rosters, players, force=force)
+    player_rates = fetch_player_rate_profiles(games, rosters, players, force=force)
 
     bundle = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -1149,6 +1293,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "quarter_log_rows": int(len(quarter_logs)) if quarter_logs is not None else 0,
         "recent_minutes_players": len(recent_minutes),
         "player_form_tags": len(player_form),
+        "player_rate_profiles": len(player_rates),
         "prior_espn_rows": int(len(prior_espn)) if prior_espn is not None else 0,
         "roster_fp": (read_cache_meta("rosters_current") or {}).get("fingerprint"),
         "injury_fp": (read_cache_meta("injuries_v2") or {}).get("fingerprint"),
@@ -1171,6 +1316,7 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
         "quarter_logs": quarter_logs,
         "recent_minutes": recent_minutes,
         "player_form": player_form,
+        "player_rates": player_rates,
         "meta": bundle,
     }
 

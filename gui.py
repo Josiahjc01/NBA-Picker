@@ -22,6 +22,12 @@ from data.fetch import fetch_games_for_date  # noqa: E402
 from data.static_arenas import ARENAS, normalize_abbrev  # noqa: E402
 from main import format_markdown, resolve_date, run_pipeline  # noqa: E402
 from model.brief import HIGHLIGHT_TITLES  # noqa: E402
+from model.calibrate import (  # noqa: E402
+    effective_score_sigma,
+    format_calibration_report,
+    grade_predictions,
+    load_calibration_state,
+)
 from safe_text import ascii_safe  # noqa: E402
 
 logging.basicConfig(
@@ -207,16 +213,25 @@ class NbaPickerApp(tk.Tk):
 
         results_tab = ttk.Frame(self.notebook, padding=4)
         quarters_tab = ttk.Frame(self.notebook, padding=4)
+        calib_tab = ttk.Frame(self.notebook, padding=4)
         self.notebook.add(results_tab, text="Results")
         self.notebook.add(quarters_tab, text="Quarters")
+        self.notebook.add(calib_tab, text="Calibration")
 
         self.results = self._make_text(results_tab)
         self.quarters_view = self._make_text(quarters_tab)
+        self.calib_view = self._make_text(calib_tab)
+        self._refresh_calibration_pane(silent=True)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, **pad)
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(
+            value=f"Ready. Effective SCORE_SIGMA={effective_score_sigma():.2f}"
+        )
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Grade finals", command=self.on_grade).pack(
+            side=tk.RIGHT, padx=2
+        )
         ttk.Button(bottom, text="Open markdown...", command=self.open_markdown).pack(
             side=tk.RIGHT, padx=2
         )
@@ -599,6 +614,51 @@ class NbaPickerApp(tk.Tk):
         )
         lines.append("")
         return "\n".join(lines)
+
+    def _refresh_calibration_pane(self, silent: bool = False) -> None:
+        state = load_calibration_state()
+        text = format_calibration_report(state if state else None)
+        self._write_pane(self.calib_view, text)
+        if not silent:
+            n = int((state or {}).get("n_games") or 0)
+            self.status_var.set(
+                f"Calibration loaded ({n} graded). "
+                f"Effective SCORE_SIGMA={effective_score_sigma():.2f}"
+            )
+
+    def on_grade(self) -> None:
+        if self._busy:
+            return
+        self._set_busy(True, "Grading stored predictions vs finals...")
+
+        def work() -> None:
+            err: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                result = grade_predictions()
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                logger.exception("Grade failed")
+
+            def done() -> None:
+                self._set_busy(False)
+                if err:
+                    msg = ascii_safe(err)
+                    self.status_var.set(f"Grade failed: {msg}")
+                    messagebox.showerror("Grade", msg)
+                    return
+                assert result is not None
+                text = result.get("text") or format_calibration_report(result.get("report"))
+                self._write_pane(self.calib_view, text)
+                self.notebook.select(2)
+                n = int((result.get("report") or {}).get("n_games") or 0)
+                self.status_var.set(
+                    f"Graded {n} games. Effective SCORE_SIGMA={effective_score_sigma():.2f}"
+                )
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def copy_ai_paste(self) -> None:
         text = (self._last_ai or "").strip()

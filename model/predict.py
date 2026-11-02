@@ -19,6 +19,7 @@ from data.process import (
     shot_profile_residual,
 )
 from data.static_arenas import normalize_abbrev
+from model.calibrate import effective_score_sigma
 from model.player_sim import run_matchup_player_sims
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,10 @@ def _mean_scores(
     away_pts += a_player_form
 
     matchup_edge, matchup_notes = playtype_matchup_residual(
-        features.get("play_types"), home, away
+        features.get("play_types"),
+        home,
+        away,
+        ratings=features.get("ratings"),
     )
     hr_edge, hr_notes = home_road_matchup_residual(
         features.get("home_road") or {}, home, away
@@ -294,6 +298,35 @@ def _normalize_sim_count(n: int | None) -> int:
     return min(config.SIM_COUNT_CHOICES, key=lambda c: abs(c - n))
 
 
+def _injury_uncertainty_sigma(features: dict[str, Any], home: str, away: str) -> float:
+    """
+    Extra score noise from probabilistic injury statuses (Q/Doubtful mass).
+    Keeps mean projection on the point-estimate path; widens MC only.
+    """
+    if not config.INJURY_MC_SAMPLE:
+        return 0.0
+    minutes = features.get("minutes")
+    if minutes is None or (isinstance(minutes, pd.DataFrame) and minutes.empty):
+        return 0.0
+    vol = 0.0
+    for team in (normalize_abbrev(home), normalize_abbrev(away)):
+        sub = minutes[minutes["team"].map(lambda x: normalize_abbrev(str(x))) == team]
+        for _, r in sub.iterrows():
+            status = str(r.get("injury_status") or "")
+            if not status:
+                continue
+            from data.process import injury_factor_distribution
+
+            p_out, p_lim, _p_full = injury_factor_distribution(status)
+            base = float(r.get("proj_minutes") or 0.0)
+            if base < 12.0:
+                continue
+            # Uncertainty mass * role minutes → points of sigma
+            uncertain = (p_out + 0.5 * p_lim) * (base / 48.0)
+            vol += 1.8 * uncertain
+    return float(np.clip(vol, 0.0, 4.0))
+
+
 def simulate_game(
     mean_home: float,
     mean_away: float,
@@ -301,6 +334,7 @@ def simulate_game(
     n: int | None = None,
     seed: int | None = None,
     return_scores: bool = False,
+    extra_sigma: float = 0.0,
 ) -> dict[str, Any]:
     """
     Vectorized Monte Carlo: correlated score noise around mean projections.
@@ -314,13 +348,20 @@ def simulate_game(
         logger.info("Running %s Monte Carlo sims (vectorized)...", f"{n:,}")
     t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
-    sig = config.SCORE_SIGMA
+    base_sig = float(effective_score_sigma())
+    sig = math.sqrt(base_sig * base_sig + max(0.0, float(extra_sigma)) ** 2)
     # Correlation ~0.15 between team scores (pace/shared environment)
     rho = 0.15
     z = rng.standard_normal((n, 2))
     z[:, 1] = rho * z[:, 0] + math.sqrt(max(0.0, 1.0 - rho * rho)) * z[:, 1]
+    # Optional injury-status sampling: shift means slightly per sim
     home = mean_home + sig * z[:, 0]
     away = mean_away + sig * z[:, 1]
+    if config.INJURY_MC_SAMPLE and extra_sigma > 0.15:
+        # Correlated tip-time uncertainty residual (same draw direction biases one side)
+        inj_z = rng.standard_normal(n)
+        home = home + 0.35 * extra_sigma * inj_z
+        away = away - 0.25 * extra_sigma * inj_z
     # Floor
     home = np.clip(home, 70.0, 160.0)
     away = np.clip(away, 70.0, 160.0)
@@ -383,8 +424,14 @@ def project_game(
     # Deterministic seed from game_id for stable re-runs
     gid = str(game.get("game_id") or f"{away}{home}{game.get('game_date')}")
     seed = abs(hash(gid)) % (2**32 - 1)
+    inj_sigma = _injury_uncertainty_sigma(features, home, away)
     sims = simulate_game(
-        home_pts, away_pts, n=sim_count, seed=seed, return_scores=True
+        home_pts,
+        away_pts,
+        n=sim_count,
+        seed=seed,
+        return_scores=True,
+        extra_sigma=inj_sigma,
     )
 
     # Prefer sim win% ; mean scores from sims (close to analytic means)

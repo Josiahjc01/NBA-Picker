@@ -139,6 +139,7 @@ def team_game_logs_from_schedules() -> list[dict[str, Any]]:
             gdate = (ev.get("date") or "")[:10]
             rows.append(
                 {
+                    "GAME_ID": str(ev.get("id") or ""),
                     "TEAM_ABBREVIATION": t["abbr"],
                     "TEAM_NAME": t["name"],
                     "GAME_DATE": gdate,
@@ -146,7 +147,7 @@ def team_game_logs_from_schedules() -> list[dict[str, Any]]:
                     "WL": "W" if my_pts > opp_pts else "L",
                     "PTS": my_pts,
                     "PLUS_MINUS": my_pts - opp_pts,
-                    # Box-score details unavailable here — process.py falls back for FF
+                    # Box-score details filled by enrich_team_logs_with_boxscores
                     "FGA": None,
                     "FTA": None,
                     "TOV": None,
@@ -158,6 +159,118 @@ def team_game_logs_from_schedules() -> list[dict[str, Any]]:
                 }
             )
     return rows
+
+
+def _box_stat_map(statistics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Flatten ESPN boxscore team statistics list into useful numeric fields."""
+    flat: dict[str, Any] = {}
+    for s in statistics or []:
+        name = str(s.get("name") or "")
+        disp = s.get("displayValue")
+        if not name:
+            continue
+        if name in {
+            "fieldGoalsMade-fieldGoalsAttempted",
+            "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
+            "freeThrowsMade-freeThrowsAttempted",
+        }:
+            made, att = _parse_made_attempted(disp)
+            if name.startswith("fieldGoals"):
+                flat["FGM"] = made
+                flat["FGA"] = att
+            elif name.startswith("threePoint"):
+                flat["FG3M"] = made
+                flat["FG3A"] = att
+            elif name.startswith("freeThrows"):
+                flat["FTM"] = made
+                flat["FTA"] = att
+            continue
+        try:
+            flat[name] = float(disp)
+        except (TypeError, ValueError):
+            continue
+    # Aliases
+    if "turnovers" in flat and "TOV" not in flat:
+        flat["TOV"] = flat["turnovers"]
+    if "offensiveRebounds" in flat and "OREB" not in flat:
+        flat["OREB"] = flat["offensiveRebounds"]
+    return flat
+
+
+def boxscore_team_stats(event_id: str) -> dict[str, dict[str, Any]]:
+    """abbr -> box counting stats for one final game."""
+    if not event_id:
+        return {}
+    try:
+        summ = _get(f"{SITE}/summary", params={"event": event_id})
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ESPN summary %s failed: %s", event_id, exc)
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for t in ((summ.get("boxscore") or {}).get("teams") or []):
+        team = t.get("team") or {}
+        abbr = normalize_abbrev(team.get("abbreviation"))
+        if not abbr:
+            continue
+        stats = _box_stat_map(t.get("statistics") or [])
+        if stats:
+            out[abbr] = stats
+    return out
+
+
+def enrich_team_logs_with_boxscores(
+    rows: list[dict[str, Any]],
+    *,
+    max_games: int = 80,
+) -> list[dict[str, Any]]:
+    """
+    Fill FGA/FTA/TOV/OREB/FG3 from ESPN game summaries for recent finals.
+    Dedupes by GAME_ID so each event is fetched once.
+    """
+    if not rows:
+        return rows
+    # Prefer most recent dates
+    dated = sorted(
+        rows,
+        key=lambda r: str(r.get("GAME_DATE") or ""),
+        reverse=True,
+    )
+    need_ids: list[str] = []
+    seen: set[str] = set()
+    for r in dated:
+        gid = str(r.get("GAME_ID") or "")
+        if not gid or gid in seen:
+            continue
+        if r.get("FGA") is not None:
+            continue
+        seen.add(gid)
+        need_ids.append(gid)
+        if len(need_ids) >= max_games:
+            break
+    cache: dict[str, dict[str, dict[str, Any]]] = {}
+    for gid in need_ids:
+        cache[gid] = boxscore_team_stats(gid)
+    filled = 0
+    out = []
+    for r in rows:
+        rr = dict(r)
+        gid = str(rr.get("GAME_ID") or "")
+        abbr = normalize_abbrev(str(rr.get("TEAM_ABBREVIATION") or ""))
+        box = (cache.get(gid) or {}).get(abbr) or {}
+        if box:
+            for k in ("FGM", "FGA", "FG3M", "FG3A", "FTA", "FTM", "TOV", "OREB"):
+                if rr.get(k) is None and box.get(k) is not None:
+                    rr[k] = box[k]
+                    filled += 1
+            if any(rr.get(k) is not None for k in ("FGA", "TOV", "OREB")):
+                rr["SOURCE"] = "espn_schedule+box"
+        out.append(rr)
+    logger.info(
+        "Enriched team logs with ESPN boxscores (%d games, %d fields)",
+        len(need_ids),
+        filled,
+    )
+    return out
 
 
 def team_season_stats() -> list[dict[str, Any]]:
@@ -510,9 +623,21 @@ def player_gamelog_recent(
     pts_i = _idx("points")
     min_i = _idx("minutes")
     fg_i = _idx("fieldGoalsMade-fieldGoalsAttempted")
+    fg3_i = _idx("threePointFieldGoalsMade-threePointFieldGoalsAttempted")
     ast_i = _idx("assists")
+    reb_i = _idx("rebounds", "totalRebounds")
+    stl_i = _idx("steals")
+    blk_i = _idx("blocks")
     if pts_i < 0:
         pts_i = len(names) - 1 if names else -1
+
+    def _fstat(stats: list[Any], idx: int) -> float | None:
+        if idx < 0 or idx >= len(stats):
+            return None
+        try:
+            return float(stats[idx])
+        except (TypeError, ValueError):
+            return None
 
     events_meta = data.get("events") or {}
     dated: list[tuple[str, dict[str, Any]]] = []
@@ -529,21 +654,13 @@ def player_gamelog_recent(
                     pts = float(stats[pts_i])
                 except (TypeError, ValueError):
                     continue
-                mins = None
-                if 0 <= min_i < len(stats):
-                    try:
-                        mins = float(stats[min_i])
-                    except (TypeError, ValueError):
-                        mins = None
+                mins = _fstat(stats, min_i)
                 fga = None
                 if 0 <= fg_i < len(stats):
                     _, fga = _parse_made_attempted(stats[fg_i])
-                ast = None
-                if 0 <= ast_i < len(stats):
-                    try:
-                        ast = float(stats[ast_i])
-                    except (TypeError, ValueError):
-                        ast = None
+                fg3m = None
+                if 0 <= fg3_i < len(stats):
+                    fg3m, _ = _parse_made_attempted(stats[fg3_i])
                 dated.append(
                     (
                         gdate,
@@ -552,7 +669,11 @@ def player_gamelog_recent(
                             "pts": pts,
                             "minutes": mins,
                             "fga": fga,
-                            "ast": ast,
+                            "ast": _fstat(stats, ast_i),
+                            "reb": _fstat(stats, reb_i),
+                            "stl": _fstat(stats, stl_i),
+                            "blk": _fstat(stats, blk_i),
+                            "fg3m": fg3m,
                             "event_id": eid,
                             "result": meta.get("gameResult"),
                         },

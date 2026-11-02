@@ -54,6 +54,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Monte Carlo sims per game (default {config.SIM_COUNT}; "
         f"choices: {', '.join(str(c) for c in config.SIM_COUNT_CHOICES)})",
     )
+    p.add_argument(
+        "--grade",
+        action="store_true",
+        help="Grade stored predictions vs finalized ESPN scores; refresh calibration",
+    )
+    p.add_argument(
+        "--calibration",
+        action="store_true",
+        help="Print calibration report (MAE / Brier / suggested SCORE_SIGMA)",
+    )
     return p.parse_args(argv)
 
 
@@ -377,6 +387,33 @@ def main(argv: list[str] | None = None) -> int:
         return launch_gui()
     if args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
+    if args.grade or args.calibration:
+        from model.calibrate import (
+            format_calibration_report,
+            grade_predictions,
+            load_calibration_state,
+        )
+
+        try:
+            if args.grade:
+                result = grade_predictions(force=args.force_refresh)
+                print(result.get("text") or format_calibration_report(result.get("report")))
+                print(f"Wrote grades under {config.GRADES_DIR}")
+            else:
+                state = load_calibration_state()
+                if not state or not state.get("n_games"):
+                    # Try grading first so empty report becomes useful
+                    result = grade_predictions(force=args.force_refresh)
+                    print(result.get("text") or format_calibration_report(result.get("report")))
+                else:
+                    print(format_calibration_report(state))
+            return 0
+        except KeyboardInterrupt:
+            print("\nInterrupted", file=sys.stderr)
+            return 130
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Calibration failed: %s", exc)
+            return 1
     try:
         target = resolve_date(args.game_date)
     except ValueError:
