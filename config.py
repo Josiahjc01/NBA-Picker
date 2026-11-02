@@ -80,6 +80,34 @@ ALTITUDE_HOME_POINTS = float(os.getenv("ALTITUDE_HOME_POINTS", "1.4"))
 ALTITUDE_PACE_BONUS = float(os.getenv("ALTITUDE_PACE_BONUS", "1.0"))
 ALTITUDE_TEAMS = frozenset({"DEN"})
 
+# Rest / density residuals (points) — also safe learning knobs
+REST_B2B_POINTS = float(os.getenv("REST_B2B_POINTS", "-1.5"))
+REST_3IN4_POINTS = float(os.getenv("REST_3IN4_POINTS", "-0.7"))
+REST_4IN6_POINTS = float(os.getenv("REST_4IN6_POINTS", "-0.5"))
+
+# Offline learning store (cache/learning/) — paste grades + capped knobs
+LEARNING_DIR = CACHE_DIR / "learning"
+LEARNING_MIN_GAMES = int(os.getenv("LEARNING_MIN_GAMES", "20"))
+LEARNING_TEAM_BIAS_MIN_GAMES = int(os.getenv("LEARNING_TEAM_BIAS_MIN_GAMES", "30"))
+LEARNING_TEAM_BIAS_CAP = float(os.getenv("LEARNING_TEAM_BIAS_CAP", "1.5"))
+LEARNING_STEP_FRAC = float(os.getenv("LEARNING_STEP_FRAC", "0.10"))  # <=10% toward target
+LEARNING_AUTO_APPLY = os.getenv("LEARNING_AUTO_APPLY", "1") not in {
+    "0",
+    "false",
+    "False",
+}
+LEARNING_SUGGEST_CONFIDENCE_MIN = float(os.getenv("LEARNING_SUGGEST_CONFIDENCE_MIN", "0.7"))
+# Hard caps for safe knobs (lo, hi)
+LEARNING_KNOB_CAPS: dict[str, tuple[float, float]] = {
+    "SCORE_SIGMA": (8.0, 14.0),
+    "MARGIN_SIGMA": (8.0, 16.0),
+    "HOME_COURT_POINTS": (1.5, 4.0),
+    "REST_B2B_POINTS": (-3.0, 1.0),
+    "REST_3IN4_POINTS": (-3.0, 1.0),
+    "REST_4IN6_POINTS": (-3.0, 1.0),
+    "ALTITUDE_HOME_POINTS": (0.5, 3.0),
+}
+
 # Quarter tendency matchup residual (points, shrunk)
 QUARTER_EDGE_CAP = float(os.getenv("QUARTER_EDGE_CAP", "1.5"))
 QUARTER_LOOKBACK_DAYS = int(os.getenv("QUARTER_LOOKBACK_DAYS", "21"))

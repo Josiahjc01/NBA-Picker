@@ -20,7 +20,7 @@ build/
 *.swp
 .DS_Store
 
-# Cache contents (keep directory)
+# Cache contents (keep directory) — includes offline learning store cache/learning/
 cache/*
 !cache/.gitkeep
 

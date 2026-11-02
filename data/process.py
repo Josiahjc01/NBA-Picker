@@ -1425,7 +1425,7 @@ def rest_and_travel_context(
             flags = []
             team_pace = pace_by_team.get(team, config.DEFAULT_PACE)
             if b2b:
-                adj -= 1.5
+                adj += float(config.REST_B2B_POINTS)
                 # Tired teams slow down more if they normally push pace
                 pace_adj -= 1.2 + 0.04 * max(0.0, team_pace - config.DEFAULT_PACE)
                 flags.append("B2B")
@@ -1443,11 +1443,11 @@ def rest_and_travel_context(
             # 3-in-4 / 4-in-6 density (includes tonight as +1 conceptually)
             if in4 >= 2:
                 # Tonight would be 3rd in 4
-                adj -= 0.7
+                adj += float(config.REST_3IN4_POINTS)
                 pace_adj -= 0.4
                 flags.append("3-in-4")
             if in6 >= 3:
-                adj -= 0.5
+                adj += float(config.REST_4IN6_POINTS)
                 pace_adj -= 0.3
                 flags.append("4-in-6")
             # Home after road B2B

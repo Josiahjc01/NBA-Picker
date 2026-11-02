@@ -22,6 +22,14 @@ from data.fetch import fetch_games_for_date  # noqa: E402
 from data.static_arenas import ARENAS, normalize_abbrev  # noqa: E402
 from main import format_markdown, resolve_date, run_pipeline  # noqa: E402
 from model.brief import HIGHLIGHT_TITLES  # noqa: E402
+from data.learning_store import (  # noqa: E402
+    apply_learning_knobs,
+    auto_update_knobs,
+    format_learning_summary,
+    import_paste,
+    reset_knobs_to_defaults,
+    summarize_learning_grades,
+)
 from model.calibrate import (  # noqa: E402
     effective_score_sigma,
     format_calibration_report,
@@ -220,7 +228,7 @@ class NbaPickerApp(tk.Tk):
 
         self.results = self._make_text(results_tab)
         self.quarters_view = self._make_text(quarters_tab)
-        self.calib_view = self._make_text(calib_tab)
+        self._build_calibration_tab(calib_tab)
         self._refresh_calibration_pane(silent=True)
 
         bottom = ttk.Frame(self)
@@ -252,6 +260,58 @@ class NbaPickerApp(tk.Tk):
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         return text
+
+    def _build_calibration_tab(self, parent: ttk.Frame) -> None:
+        """Calibration + offline Learning: report, paste import, knobs."""
+        apply_learning_knobs()
+        top = ttk.Frame(parent)
+        top.pack(fill=tk.X, pady=(0, 4))
+        self.learning_summary_var = tk.StringVar(value="Learning: n=0")
+        ttk.Label(top, textvariable=self.learning_summary_var).pack(side=tk.LEFT)
+        ttk.Button(top, text="Refresh", command=self._refresh_calibration_pane).pack(
+            side=tk.RIGHT, padx=2
+        )
+        ttk.Button(top, text="Reset knobs", command=self.on_reset_knobs).pack(
+            side=tk.RIGHT, padx=2
+        )
+        ttk.Button(top, text="Apply knobs", command=self.on_apply_knobs).pack(
+            side=tk.RIGHT, padx=2
+        )
+
+        # Report (calibration + learning)
+        report_frame = ttk.LabelFrame(parent, text="Report (MAE / Brier / knobs)")
+        report_frame.pack(fill=tk.BOTH, expand=True)
+        self.calib_view = self._make_text(report_frame)
+
+        # Paste area
+        paste_frame = ttk.LabelFrame(
+            parent,
+            text="Paste real game / AI comparison (JSON or ASCII DATE/ACT/PRED)",
+        )
+        paste_frame.pack(fill=tk.BOTH, expand=False, pady=(6, 0))
+        paste_wrap = ttk.Frame(paste_frame)
+        paste_wrap.pack(fill=tk.BOTH, expand=True)
+        self.paste_view = tk.Text(
+            paste_wrap, wrap=tk.WORD, font=("Consolas", 9), height=8
+        )
+        paste_scroll = ttk.Scrollbar(
+            paste_wrap, orient=tk.VERTICAL, command=self.paste_view.yview
+        )
+        self.paste_view.configure(yscrollcommand=paste_scroll.set)
+        self.paste_view.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        paste_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        paste_btns = ttk.Frame(paste_frame)
+        paste_btns.pack(fill=tk.X, pady=4)
+        ttk.Button(
+            paste_btns, text="Apply paste", command=self.on_apply_paste
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            paste_btns, text="Clear paste", command=lambda: self.paste_view.delete("1.0", tk.END)
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            paste_btns,
+            text="Means/win% only — never Highlights sim-maxes. Code themes -> inbox.",
+        ).pack(side=tk.LEFT, padx=8)
 
     def _parse_date(self) -> date | None:
         raw = self.date_var.get().strip()
@@ -616,15 +676,147 @@ class NbaPickerApp(tk.Tk):
         return "\n".join(lines)
 
     def _refresh_calibration_pane(self, silent: bool = False) -> None:
+        apply_learning_knobs()
         state = load_calibration_state()
-        text = format_calibration_report(state if state else None)
+        calib_text = format_calibration_report(state if state else None)
+        learn_text = format_learning_summary()
+        text = learn_text + "\n" + calib_text
         self._write_pane(self.calib_view, text)
+        summary = summarize_learning_grades()
+        n = int(summary.get("n_games") or 0)
+        mae_t = summary.get("mae_total")
+        mae_m = summary.get("mae_margin")
+        brier = summary.get("brier")
+        self.learning_summary_var.set(
+            f"Learning: n={n}  MAE total={mae_t}  MAE margin={mae_m}  "
+            f"Brier={brier}  SCORE_SIGMA={effective_score_sigma():.2f}"
+        )
         if not silent:
-            n = int((state or {}).get("n_games") or 0)
             self.status_var.set(
-                f"Calibration loaded ({n} graded). "
+                f"Calibration/learning loaded ({n} graded). "
                 f"Effective SCORE_SIGMA={effective_score_sigma():.2f}"
             )
+
+    def on_apply_paste(self) -> None:
+        if self._busy:
+            return
+        raw = self.paste_view.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showinfo(
+                "Paste",
+                "Paste real_box / ai_comparison JSON or ASCII DATE/ACT/PRED block first.",
+            )
+            return
+        self._set_busy(True, "Applying paste into offline learning...")
+
+        def work() -> None:
+            err: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                result = import_paste(raw, auto_knobs=True)
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                logger.exception("Paste import failed")
+
+            def done() -> None:
+                self._set_busy(False)
+                if err:
+                    msg = ascii_safe(err)
+                    self.status_var.set(f"Paste failed: {msg}")
+                    messagebox.showerror("Paste", msg)
+                    return
+                assert result is not None
+                self._refresh_calibration_pane(silent=True)
+                self.notebook.select(2)
+                g = result.get("grade") or {}
+                self.status_var.set(
+                    f"Paste graded {g.get('away_abbr')}@{g.get('home_abbr')} "
+                    f"err_total={g.get('abs_err_total')}  "
+                    f"SCORE_SIGMA={effective_score_sigma():.2f}"
+                )
+                themes = result.get("code_themes_inbox")
+                extra = (
+                    f"\nCode themes queued (not auto-applied):\n{themes}"
+                    if themes
+                    else ""
+                )
+                knobs = result.get("knobs") or {}
+                if knobs.get("applied"):
+                    extra += f"\nKnobs updated: {knobs.get('changes')}"
+                elif knobs.get("skipped_reason"):
+                    extra += f"\nKnobs: {knobs.get('skipped_reason')}"
+                messagebox.showinfo(
+                    "Paste applied",
+                    ascii_safe(
+                        f"Graded means/win% for {g.get('away_abbr')}@{g.get('home_abbr')}.\n"
+                        f"abs_err_total={g.get('abs_err_total')}  "
+                        f"abs_err_margin={g.get('abs_err_margin')}  "
+                        f"brier={g.get('brier')}"
+                        f"{extra}"
+                    ),
+                )
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_apply_knobs(self) -> None:
+        if self._busy:
+            return
+        self._set_busy(True, "Applying capped learning knobs...")
+
+        def work() -> None:
+            err: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                result = auto_update_knobs(reason="gui_apply", force=True)
+            except Exception as exc:  # noqa: BLE001
+                err = exc
+                logger.exception("Apply knobs failed")
+
+            def done() -> None:
+                self._set_busy(False)
+                if err:
+                    msg = ascii_safe(err)
+                    self.status_var.set(f"Apply knobs failed: {msg}")
+                    messagebox.showerror("Apply knobs", msg)
+                    return
+                assert result is not None
+                self._refresh_calibration_pane(silent=True)
+                self.notebook.select(2)
+                if result.get("applied"):
+                    self.status_var.set(
+                        f"Knobs applied. SCORE_SIGMA={effective_score_sigma():.2f}"
+                    )
+                    messagebox.showinfo(
+                        "Apply knobs",
+                        ascii_safe(f"Updated: {result.get('changes')}"),
+                    )
+                else:
+                    reason = result.get("skipped_reason") or "No changes"
+                    self.status_var.set(ascii_safe(str(reason)))
+                    messagebox.showinfo("Apply knobs", ascii_safe(str(reason)))
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_reset_knobs(self) -> None:
+        if self._busy:
+            return
+        if not messagebox.askyesno(
+            "Reset knobs",
+            "Reset knobs_current.json to config defaults?",
+        ):
+            return
+        try:
+            reset_knobs_to_defaults(reason="gui_reset")
+            self._refresh_calibration_pane(silent=True)
+            self.status_var.set(
+                f"Knobs reset. SCORE_SIGMA={effective_score_sigma():.2f}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Reset knobs", ascii_safe(exc))
 
     def on_grade(self) -> None:
         if self._busy:
@@ -648,8 +840,7 @@ class NbaPickerApp(tk.Tk):
                     messagebox.showerror("Grade", msg)
                     return
                 assert result is not None
-                text = result.get("text") or format_calibration_report(result.get("report"))
-                self._write_pane(self.calib_view, text)
+                self._refresh_calibration_pane(silent=True)
                 self.notebook.select(2)
                 n = int((result.get("report") or {}).get("n_games") or 0)
                 self.status_var.set(

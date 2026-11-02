@@ -64,6 +64,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print calibration report (MAE / Brier / suggested SCORE_SIGMA)",
     )
+    p.add_argument(
+        "--import-paste",
+        dest="import_paste",
+        default=None,
+        metavar="FILE",
+        help="Import real_box / ai_comparison JSON (or ASCII paste file) into offline learning",
+    )
+    p.add_argument(
+        "--learning",
+        action="store_true",
+        help="Print offline learning summary (MAE / Brier / knobs)",
+    )
+    p.add_argument(
+        "--reset-knobs",
+        action="store_true",
+        help="Reset learning knobs_current.json to config defaults",
+    )
+    p.add_argument(
+        "--apply-knobs",
+        action="store_true",
+        help="Run capped auto-knob update from graded learning history",
+    )
     return p.parse_args(argv)
 
 
@@ -300,6 +322,14 @@ def run_pipeline(
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Offline learning: overlay capped knobs so projections move with history
+    try:
+        from data.learning_store import apply_learning_knobs
+
+        apply_learning_knobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Learning knobs not applied: %s", exc)
+
     raw = fetch_all(target, force=force)
     features = build_features(raw, target)
     predictions = enrich_predictions_with_brief(
@@ -387,7 +417,14 @@ def main(argv: list[str] | None = None) -> int:
         return launch_gui()
     if args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
-    if args.grade or args.calibration:
+    if (
+        args.grade
+        or args.calibration
+        or args.import_paste
+        or args.learning
+        or args.reset_knobs
+        or args.apply_knobs
+    ):
         from model.calibrate import (
             format_calibration_report,
             grade_predictions,
@@ -395,10 +432,52 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         try:
+            if args.reset_knobs:
+                from data.learning_store import format_learning_summary, reset_knobs_to_defaults
+
+                reset_knobs_to_defaults(reason="cli_reset")
+                print(format_learning_summary())
+                print("Knobs reset to config defaults.")
+                return 0
+            if args.apply_knobs:
+                from data.learning_store import auto_update_knobs, format_learning_summary
+
+                result = auto_update_knobs(reason="cli_apply", force=True)
+                print(format_learning_summary())
+                if result.get("applied"):
+                    print(f"Applied knob changes: {result.get('changes')}")
+                else:
+                    print(f"No knob apply: {result.get('skipped_reason')}")
+                return 0
+            if args.import_paste:
+                from data.learning_store import format_learning_summary, import_paste
+
+                path = Path(args.import_paste)
+                text = path.read_text(encoding="utf-8")
+                result = import_paste(text, auto_knobs=True)
+                print(format_learning_summary())
+                safe_print(
+                    f"Imported {result.get('kind')} -> "
+                    f"{result.get('grade', {}).get('away_abbr')}@"
+                    f"{result.get('grade', {}).get('home_abbr')} "
+                    f"err_total={result.get('grade', {}).get('abs_err_total')}"
+                )
+                if result.get("code_themes_inbox"):
+                    print(f"Code themes queued: {result['code_themes_inbox']}")
+                return 0
+            if args.learning:
+                from data.learning_store import format_learning_summary
+
+                print(format_learning_summary())
+                return 0
             if args.grade:
                 result = grade_predictions(force=args.force_refresh)
                 print(result.get("text") or format_calibration_report(result.get("report")))
                 print(f"Wrote grades under {config.GRADES_DIR}")
+                learning = result.get("learning") or {}
+                if learning.get("summary_text"):
+                    print()
+                    print(learning["summary_text"])
             else:
                 state = load_calibration_state()
                 if not state or not state.get("n_games"):
@@ -412,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\nInterrupted", file=sys.stderr)
             return 130
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Calibration failed: %s", exc)
+            logger.exception("Calibration / learning failed: %s", exc)
             return 1
     try:
         target = resolve_date(args.game_date)

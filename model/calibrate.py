@@ -47,7 +47,17 @@ def save_calibration_state(state: dict[str, Any]) -> Path:
 
 
 def effective_score_sigma() -> float:
-    """SCORE_SIGMA possibly nudged by graded history (capped)."""
+    """SCORE_SIGMA from learning knobs when present, else capped calibration blend."""
+    try:
+        from data.learning_store import apply_learning_knobs, load_knobs
+
+        apply_learning_knobs()
+        knobs = load_knobs()
+        if knobs.get("SCORE_SIGMA") is not None:
+            return float(config.SCORE_SIGMA)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Learning knobs unavailable for SCORE_SIGMA: %s", exc)
+
     base = float(config.SCORE_SIGMA)
     if not config.CALIBRATION_AUTO_APPLY:
         return base
@@ -67,6 +77,20 @@ def effective_score_sigma() -> float:
     return float(
         np.clip(blended, config.CALIBRATION_SIGMA_MIN, config.CALIBRATION_SIGMA_MAX)
     )
+
+
+def effective_margin_sigma() -> float:
+    """MARGIN_SIGMA from learning knobs when present, else config default."""
+    try:
+        from data.learning_store import apply_learning_knobs, load_knobs
+
+        apply_learning_knobs()
+        knobs = load_knobs()
+        if knobs.get("MARGIN_SIGMA") is not None:
+            return float(config.MARGIN_SIGMA)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Learning knobs unavailable for MARGIN_SIGMA: %s", exc)
+    return float(config.MARGIN_SIGMA)
 
 
 def _list_prediction_files() -> list[Path]:
@@ -279,6 +303,26 @@ def grade_predictions(
         "grades_path": str(grades_path),
     }
     save_calibration_state(state)
+
+    # Sync into offline learning store + capped auto-knobs (paste path shares this).
+    learning_info: dict[str, Any] = {}
+    try:
+        from data.learning_store import (
+            auto_update_knobs,
+            format_learning_summary,
+            sync_grades_from_list,
+        )
+
+        added = sync_grades_from_list(graded, source="espn_grade")
+        knob_result = auto_update_knobs(reason="espn_grade")
+        learning_info = {
+            "synced": added,
+            "knobs": knob_result,
+            "summary_text": format_learning_summary(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Learning store sync failed: %s", exc)
+
     logger.info(
         "Graded %s games; MAE total=%.2f margin=%.2f Brier=%.4f suggested sigma=%.2f",
         report.get("n_games"),
@@ -287,7 +331,13 @@ def grade_predictions(
         report.get("brier") or 0,
         report.get("suggested_score_sigma") or config.SCORE_SIGMA,
     )
-    return {"grades": graded, "report": report, "text": report_txt, "state": state}
+    return {
+        "grades": graded,
+        "report": report,
+        "text": report_txt,
+        "state": state,
+        "learning": learning_info,
+    }
 
 
 def summarize_grades(graded: list[dict[str, Any]]) -> dict[str, Any]:
