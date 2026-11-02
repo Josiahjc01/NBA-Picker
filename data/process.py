@@ -53,6 +53,36 @@ def minutes_factor_from_status(status: str) -> float:
     return 1.0
 
 
+def injury_factor_distribution(status: str) -> tuple[float, float, float]:
+    """
+    Probabilistic injury model: (p_out, p_limited, p_full) approximating
+    status uncertainty. Means match minutes_factor_from_status roughly.
+    """
+    if not status:
+        return (0.0, 0.0, 1.0)
+    if OUT_STATUSES.search(status):
+        return (0.92, 0.06, 0.02)
+    if DOUBTFUL.search(status):
+        return (0.70, 0.25, 0.05)
+    if QUESTIONABLE.search(status):
+        return (0.30, 0.45, 0.25)
+    if PROBABLE.search(status):
+        return (0.05, 0.20, 0.75)
+    return (0.0, 0.0, 1.0)
+
+
+def sample_injury_factor(status: str, rng: np.random.Generator) -> float:
+    """Draw a minutes factor from the injury status distribution."""
+    p_out, p_lim, p_full = injury_factor_distribution(status)
+    u = float(rng.random())
+    if u < p_out:
+        return 0.0
+    if u < p_out + p_lim:
+        # Limited: around 0.45–0.70 of projected minutes
+        return float(0.45 + 0.25 * rng.random())
+    return 1.0
+
+
 def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").strip()).lower()
 
@@ -588,8 +618,8 @@ def shot_profile_residual(
     away: str,
 ) -> tuple[float, list[str]]:
     """
-    Light 3PT-volume residual from ESPN season averages when Synergy is thin.
-    Heavy shrinkage; ASCII notes.
+    Shot/defense matchup: offense 3PA/g vs opponent 3PA allowed proxy +
+    FG3% vs opp points allowed tilt. Heavy shrinkage; ASCII notes.
     """
     if team_adv is None or (isinstance(team_adv, pd.DataFrame) and team_adv.empty):
         return 0.0, []
@@ -613,25 +643,110 @@ def shot_profile_residual(
     if not hr or not ar:
         return 0.0, []
 
-    def _fga3(row: dict[str, Any]) -> float | None:
-        for k in ("AVG_FG3A", "avgThreePointFieldGoalsAttempted", "FG3A"):
+    def _num(row: dict[str, Any], *keys: str) -> float | None:
+        for k in keys:
             if k in row and row[k] is not None:
                 try:
-                    return float(row[k])
+                    v = float(row[k])
                 except (TypeError, ValueError):
                     continue
+                if np.isfinite(v):
+                    return v
+            # Nested RAW dict from ESPN
+            raw = row.get("RAW") if isinstance(row.get("RAW"), dict) else {}
+            if k in raw and raw[k] is not None:
+                try:
+                    v = float(raw[k])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(v):
+                    return v
         return None
 
-    h3, a3 = _fga3(hr), _fga3(ar)
+    h3 = _num(hr, "AVG_FG3A", "avgThreePointFieldGoalsAttempted", "FG3A")
+    a3 = _num(ar, "AVG_FG3A", "avgThreePointFieldGoalsAttempted", "FG3A")
+    # Opp 3PA allowed proxy: league ± (opp_pts tilt) when explicit allow missing
+    h_opp = _num(hr, "OPP_PTS", "avgPointsAllowed", "avgOpponentPoints")
+    a_opp = _num(ar, "OPP_PTS", "avgPointsAllowed", "avgOpponentPoints")
+    h_fg3 = _num(hr, "FG3_PCT", "threePointPct", "threePointFieldGoalPct")
+    a_fg3 = _num(ar, "FG3_PCT", "threePointPct", "threePointFieldGoalPct")
     if h3 is None or a3 is None:
         return 0.0, []
-    league = 37.0  # typical team 3PA/g
-    # High-volume 3PT offense vs low-volume opponent slight pace/variance edge — tiny
-    edge = 0.04 * ((h3 - league) - (a3 - league))
-    edge = float(np.clip(edge, -0.8, 0.8))
+    league_3 = 37.0
+    league_opp = config.LEAGUE_AVG_TOTAL / 2.0
+    # Offense volume vs opponent "softness" (higher opp pts allowed => softer D)
+    h_soft = ((a_opp or league_opp) - league_opp) / 10.0
+    a_soft = ((h_opp or league_opp) - league_opp) / 10.0
+    vol_edge = 0.035 * ((h3 - league_3) * (1.0 + 0.15 * h_soft) - (a3 - league_3) * (1.0 + 0.15 * a_soft))
+    pct_edge = 0.0
+    if h_fg3 is not None and a_fg3 is not None:
+        # Scale FG3% (0.36 style) to points-ish residual
+        pct_edge = 8.0 * ((h_fg3 - 0.36) - (a_fg3 - 0.36))
+        pct_edge *= 0.08
+    edge = float(np.clip(vol_edge + pct_edge, -1.4, 1.4))
     notes = []
-    if abs(h3 - a3) >= 6.0:
+    if abs(h3 - a3) >= 5.0:
         notes.append(f"3PA/g: {home} {h3:.1f} vs {away} {a3:.1f}")
+    if h_opp is not None and a_opp is not None and abs((a_opp or 0) - (h_opp or 0)) >= 4.0:
+        notes.append(f"Opp pts allow: {home} {h_opp:.1f} / {away} {a_opp:.1f}")
+    return edge, notes
+
+
+def four_factor_matchup_residual(
+    ratings: pd.DataFrame | None,
+    home: str,
+    away: str,
+) -> tuple[float, list[str]]:
+    """
+    Degrade path when Synergy play-types are empty: eFG / TOV / ORB / FT rate
+    offense vs opponent defense proxies from the ratings frame.
+    """
+    if ratings is None or (isinstance(ratings, pd.DataFrame) and ratings.empty):
+        return 0.0, []
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+
+    def _row(abbr: str) -> dict[str, Any] | None:
+        hit = ratings[ratings["team"].map(lambda x: normalize_abbrev(str(x))) == abbr]
+        if hit.empty:
+            return None
+        return hit.iloc[0].to_dict()
+
+    hr, ar = _row(home), _row(away)
+    if not hr or not ar:
+        return 0.0, []
+
+    def _f(row: dict[str, Any], key: str, default: float) -> float:
+        try:
+            v = float(row.get(key))
+            return v if np.isfinite(v) else default
+        except (TypeError, ValueError):
+            return default
+
+    # Home offense vs away "defense" (inverse of away eFG allowed ≈ use away eFG as softness)
+    h_off = (
+        12.0 * (_f(hr, "efg", 0.53) - 0.53)
+        - 20.0 * (_f(hr, "tov_pct", 0.13) - 0.13)
+        + 6.0 * (_f(hr, "orb_pct", 0.28) - 0.28)
+        + 5.0 * (_f(hr, "ft_rate", 0.25) - 0.25)
+    )
+    a_off = (
+        12.0 * (_f(ar, "efg", 0.53) - 0.53)
+        - 20.0 * (_f(ar, "tov_pct", 0.13) - 0.13)
+        + 6.0 * (_f(ar, "orb_pct", 0.28) - 0.28)
+        + 5.0 * (_f(ar, "ft_rate", 0.25) - 0.25)
+    )
+    # Opponent defensive quality from net/def_rtg
+    h_def_q = (_f(hr, "def_rtg", config.DEFAULT_DEF_RTG) - config.DEFAULT_DEF_RTG) / 8.0
+    a_def_q = (_f(ar, "def_rtg", config.DEFAULT_DEF_RTG) - config.DEFAULT_DEF_RTG) / 8.0
+    # Positive edge = home advantage from FF matchup
+    edge = 0.12 * ((h_off - a_def_q) - (a_off - h_def_q))
+    edge = float(np.clip(edge, -config.MATCHUP_RESIDUAL_CAP, config.MATCHUP_RESIDUAL_CAP))
+    notes = []
+    if abs(edge) >= 0.35:
+        notes.append(
+            f"FF matchup: {home} eFG {_f(hr, 'efg', 0.53):.3f} vs {away} eFG {_f(ar, 'efg', 0.53):.3f}"
+        )
     return edge, notes
 
 
@@ -1045,9 +1160,109 @@ def project_player_minutes(
                 "adj_minutes": round(mins * factor, 2),
                 "injury_status": (inj or {}).get("status"),
                 "injury_source": (inj or {}).get("source"),
+                # Possession/usage proxy: FGA/36 from recent logs (filled below)
+                "usage_share": None,
             }
         )
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = _attach_usage_shares(out)
+    return out
+
+
+def _attach_usage_shares(minute_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize per-team usage proxy (FGA/36 * adj_minutes) into shares."""
+    df = minute_df.copy()
+    shares = np.zeros(len(df), dtype=float)
+    for team, idx in df.groupby("team").groups.items():
+        if not team:
+            continue
+        sub = df.loc[idx]
+        usage = pd.to_numeric(sub.get("usage_fga36"), errors="coerce").fillna(12.0)
+        mins = pd.to_numeric(sub.get("adj_minutes"), errors="coerce").fillna(0.0)
+        # Only active players contribute to share mass
+        mass = (np.maximum(usage, 4.0) ** float(config.USAGE_SHARE_POWER)) * np.maximum(mins, 0.0)
+        total = float(mass.sum())
+        if total <= 1e-9:
+            # Equal among anyone with minutes
+            active = mins > 0
+            n_act = int(active.sum()) or len(sub)
+            for i, ix in enumerate(idx):
+                shares[df.index.get_loc(ix)] = (1.0 / n_act) if (mins.iloc[i] > 0 or n_act == len(sub)) else 0.0
+        else:
+            for i, ix in enumerate(idx):
+                shares[df.index.get_loc(ix)] = float(mass.iloc[i] / total)
+    df["usage_share"] = np.round(shares, 4)
+    return df
+
+
+def redistribute_minutes_for_injuries(minute_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Spill minutes from Out/near-Out rotation players onto healthy teammates.
+    Injury-first: Out stay at 0; healthy get capped bumps proportional to usage.
+    """
+    if minute_df is None or minute_df.empty or not config.INJURY_MINUTES_REDISTRIBUTE:
+        return minute_df
+    df = minute_df.copy()
+    if "adj_minutes" not in df.columns or "proj_minutes" not in df.columns:
+        return df
+    df["minutes_spill"] = 0.0
+    for team, idx in df.groupby("team").groups.items():
+        if not team:
+            continue
+        sub = df.loc[list(idx)].copy()
+        lost = 0.0
+        for _, r in sub.iterrows():
+            base = float(r.get("proj_minutes") or 0.0)
+            adj = float(r.get("adj_minutes") or 0.0)
+            if base >= 12.0 and adj < base - 0.5:
+                lost += base - adj
+        lost = float(np.clip(lost, 0.0, config.INJURY_REDIST_TEAM_CAP))
+        if lost < 1.0:
+            continue
+        # Recipients: healthy enough (factor >= 0.85) with some role
+        recipients = []
+        for ix in idx:
+            r = df.loc[ix]
+            try:
+                factor = float(r["minutes_factor"]) if r.get("minutes_factor") is not None else 1.0
+            except (TypeError, ValueError):
+                factor = 1.0
+            try:
+                base = float(r["proj_minutes"]) if r.get("proj_minutes") is not None else 0.0
+            except (TypeError, ValueError):
+                base = 0.0
+            try:
+                adj_now = float(r["adj_minutes"]) if r.get("adj_minutes") is not None else 0.0
+            except (TypeError, ValueError):
+                adj_now = 0.0
+            # Never spill onto Out/Doubtful (keep injury-first zeros)
+            if factor < 0.85 or adj_now < 1.0 or base < 8.0:
+                continue
+            usage = 12.0
+            try:
+                if r.get("usage_fga36") is not None:
+                    usage = float(r["usage_fga36"])
+            except (TypeError, ValueError):
+                usage = 12.0
+            weight = max(usage, 6.0) * max(base, 1.0)
+            recipients.append((ix, weight))
+        if not recipients:
+            continue
+        wsum = sum(w for _, w in recipients) or 1.0
+        for ix, w in recipients:
+            bump = lost * (w / wsum)
+            bump = float(np.clip(bump, 0.0, config.INJURY_REDIST_CAP_PER_PLAYER))
+            try:
+                cur = float(df.at[ix, "adj_minutes"])
+            except (TypeError, ValueError):
+                cur = 0.0
+            new_adj = float(np.clip(cur + bump, 0.0, 42.0))
+            df.at[ix, "minutes_spill"] = round(bump, 2)
+            df.at[ix, "adj_minutes"] = round(new_adj, 2)
+    # Recompute usage shares after spill
+    df = _attach_usage_shares(df)
+    return df
 
 
 def team_impact_from_players(
@@ -1142,6 +1357,9 @@ def rest_and_travel_context(
     """
     last_game: dict[str, date] = {}
     last_venue: dict[str, str] = {}
+    # Recent game dates + was-away flags for density / road-B2B patterns
+    recent_dates: dict[str, list[date]] = {}
+    recent_away: dict[str, list[bool]] = {}
     pace_by_team: dict[str, float] = {}
     if ratings is not None and not ratings.empty and "team" in ratings.columns:
         for _, r in ratings.iterrows():
@@ -1165,16 +1383,21 @@ def rest_and_travel_context(
                     continue
                 abbr = r["_abbr"]
                 last_game[abbr] = r["_date"]
+                recent_dates.setdefault(abbr, []).append(r["_date"])
                 # MATCHUP like "BOS @ MIA" or "BOS vs. MIA"
                 venue = abbr
+                was_away = False
                 if match_c and isinstance(r.get(match_c), str):
                     m = str(r[match_c])
                     if "@" in m:
                         parts = m.split("@")
                         venue = normalize_abbrev(parts[-1].strip().split()[-1])
+                        was_away = True
                     else:
                         venue = abbr
+                        was_away = False
                 last_venue[abbr] = venue
+                recent_away.setdefault(abbr, []).append(was_away)
 
     ctx: dict[str, dict[str, Any]] = {}
     for g in games:
@@ -1189,6 +1412,13 @@ def rest_and_travel_context(
             prev_venue = last_venue.get(team, team)
             miles = travel_miles(prev_venue, home)
             tz = timezone_shift_hours(prev_venue, home)
+            dates = recent_dates.get(team) or []
+            aways = recent_away.get(team) or []
+            # Density: games in last 4 / 6 calendar days (excluding today)
+            in4 = sum(1 for d in dates if 0 < (target - d).days <= 4)
+            in6 = sum(1 for d in dates if 0 < (target - d).days <= 6)
+            # Last game was on the road?
+            last_was_away = bool(aways[-1]) if aways else False
             # Point residual: B2B / travel / TZ (small)
             adj = 0.0
             pace_adj = 0.0  # possessions delta
@@ -1210,6 +1440,20 @@ def rest_and_travel_context(
                 flags.append(f"rest={rest}d")
             else:
                 flags.append(f"rest={rest}d")
+            # 3-in-4 / 4-in-6 density (includes tonight as +1 conceptually)
+            if in4 >= 2:
+                # Tonight would be 3rd in 4
+                adj -= 0.7
+                pace_adj -= 0.4
+                flags.append("3-in-4")
+            if in6 >= 3:
+                adj -= 0.5
+                pace_adj -= 0.3
+                flags.append("4-in-6")
+            # Home after road B2B
+            if is_home and b2b and last_was_away:
+                adj -= 0.45
+                flags.append("home-after-road-B2B")
             if miles >= 1500:
                 adj -= 0.8
                 pace_adj -= 0.5
@@ -1226,24 +1470,32 @@ def rest_and_travel_context(
                 flags.append("home")
             else:
                 flags.append("away")
-            # Denver altitude: boost home, slight pace up for both
+            # Denver altitude: boost home, slight pace up for both;
+            # travelers (away) get an extra hit (altitude traveler)
             if home in config.ALTITUDE_TEAMS:
                 if is_home:
                     adj += config.ALTITUDE_HOME_POINTS
                     flags.append("altitude-home")
                 else:
                     adj -= 0.35 * config.ALTITUDE_HOME_POINTS
-                    flags.append("altitude-away")
+                    # Extra traveler fatigue into altitude
+                    if miles >= 600 or last_was_away:
+                        adj -= 0.35
+                        flags.append("altitude-traveler")
+                    else:
+                        flags.append("altitude-away")
                 pace_adj += 0.5 * config.ALTITUDE_PACE_BONUS
             ctx[f"{g.get('game_id')}:{team}"] = {
                 "team": team,
                 "game_id": g.get("game_id"),
                 "rest_days": rest,
                 "b2b": b2b,
+                "games_in_4": in4,
+                "games_in_6": in6,
                 "travel_miles": miles,
                 "tz_shift": tz,
                 "context_points": adj,
-                "pace_adj": float(np.clip(pace_adj, -3.0, 2.5)),
+                "pace_adj": float(np.clip(pace_adj, -3.5, 2.5)),
                 "flags": flags,
             }
     return ctx
@@ -1253,25 +1505,47 @@ def playtype_matchup_residual(
     play_types: pd.DataFrame,
     home: str,
     away: str,
+    *,
+    ratings: pd.DataFrame | None = None,
 ) -> tuple[float, list[str]]:
-    """Small residual from offensive play-type PPP vs opponent (shrunk)."""
-    if play_types is None or play_types.empty:
-        return 0.0, []
+    """
+    Play-type PPP residual when Synergy rows exist; otherwise degrade to
+    four-factor matchup from ratings (eFG/TOV/ORB/FT vs opp def).
+    Prefers defensive grouping rows when PLAY_TYPE contains 'defense'.
+    """
+    home = normalize_abbrev(home)
+    away = normalize_abbrev(away)
+    if play_types is None or (isinstance(play_types, pd.DataFrame) and play_types.empty):
+        return four_factor_matchup_residual(ratings, home, away)
+
     df = play_types.copy()
     team_c = next((c for c in ("TEAM_ABBREVIATION", "TeamAbbreviation", "team") if c in df.columns), None)
     pt_c = next((c for c in ("PLAY_TYPE", "play_type") if c in df.columns), None)
     ppp_c = next((c for c in ("PPP", "POINTS", "PTS") if c in df.columns), None)
+    side_c = next(
+        (c for c in ("TYPE_GROUPING", "type_grouping", "SIDE", "offenseDefense") if c in df.columns),
+        None,
+    )
     if not team_c or not pt_c or not ppp_c:
-        return 0.0, []
+        return four_factor_matchup_residual(ratings, home, away)
 
     df["_team"] = df[team_c].map(lambda x: normalize_abbrev(str(x)))
     df["_ppp"] = pd.to_numeric(df[ppp_c], errors="coerce")
-    league = df.groupby(pt_c)["_ppp"].mean()
+    if side_c:
+        df["_side"] = df[side_c].astype(str).str.lower()
+    else:
+        df["_side"] = "offensive"
+
+    off = df[~df["_side"].str.contains("def")]
+    deff = df[df["_side"].str.contains("def")]
+    if off.empty:
+        off = df
+    league = off.groupby(pt_c)["_ppp"].mean()
 
     notes = []
     edge = 0.0
     for team, opp in ((home, away), (away, home)):
-        tg = df[df["_team"] == team]
+        tg = off[off["_team"] == team]
         if tg.empty:
             continue
         for _, r in tg.iterrows():
@@ -1279,13 +1553,24 @@ def playtype_matchup_residual(
             ppp = r["_ppp"]
             if pd.isna(ppp) or pt not in league.index:
                 continue
-            # Without true defensive ranks, use deviation from league as soft edge
             delta = float(ppp - league.loc[pt])
-            # shrink heavily
+            # Opponent defensive PPP allowed for same play type when present
+            if not deff.empty:
+                opp_d = deff[(deff["_team"] == opp) & (deff[pt_c] == pt)]
+                if not opp_d.empty:
+                    try:
+                        opp_ppp = float(opp_d.iloc[0]["_ppp"])
+                        # Higher defensive PPP allowed = softer
+                        delta += 0.5 * (opp_ppp - float(league.loc[pt]))
+                    except (TypeError, ValueError):
+                        pass
             contrib = 0.15 * delta * (1 if team == home else -1)
             edge += contrib
             if abs(delta) >= 0.08:
                 notes.append(f"{team} {pt} PPP {ppp:.2f} (lg {league.loc[pt]:.2f})")
+
+    if abs(edge) < 1e-9 and notes == []:
+        return four_factor_matchup_residual(ratings, home, away)
 
     edge = float(np.clip(edge, -config.MATCHUP_RESIDUAL_CAP, config.MATCHUP_RESIDUAL_CAP))
     notes = notes[:3]
@@ -1343,6 +1628,7 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         inj_idx,
         recent_minutes=raw.get("recent_minutes") or {},
     )
+    minutes = redistribute_minutes_for_injuries(minutes)
     impact = team_impact_from_players(minutes, raw.get("impact") or [])
     context = rest_and_travel_context(
         raw.get("games") or [],
@@ -1361,6 +1647,7 @@ def build_features(raw: dict[str, Any], target: date) -> dict[str, Any]:
         "context": context,
         "team_form": team_form,
         "player_form": raw.get("player_form") or {},
+        "player_rates": raw.get("player_rates") or {},
         "home_road": home_road,
         "quarter_profiles": quarter_profiles,
         "srs": srs,

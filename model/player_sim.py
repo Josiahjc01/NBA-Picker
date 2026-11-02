@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+import config
 from data.static_arenas import normalize_abbrev
 
 logger = logging.getLogger(__name__)
@@ -99,10 +100,11 @@ def build_active_roster(
     team: str,
     *,
     min_adj_minutes: float = MIN_ADJ_MINUTES,
+    player_rates: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Active players for a team with generative means (per-minute season rates
-    x adj_minutes). Out / 0-minute players are excluded.
+    Active players with generative means = blended recent L5/L10 + season
+    rates x adj_minutes. Out / 0-minute players are excluded.
     """
     abbr = normalize_abbrev(team)
     if minutes is None or (isinstance(minutes, pd.DataFrame) and minutes.empty):
@@ -119,38 +121,66 @@ def build_active_roster(
         return []
 
     season_by = _season_rates_by_name(players)
+    rates_by = player_rates or {}
+    w5 = float(config.PLAYER_RATE_W_L5)
+    w10 = float(config.PLAYER_RATE_W_L10)
+    w_s = float(config.PLAYER_RATE_W_SEASON)
+    w_sum = max(w5 + w10 + w_s, 1e-9)
+    w5, w10, w_s = w5 / w_sum, w10 / w_sum, w_s / w_sum
+
     roster: list[dict[str, Any]] = []
     for _, r in team_min.iterrows():
         name = str(r.get("player") or "")
         key = _norm_name(name)
         adj = float(r["_adj"])
         season = season_by.get(key) or {}
+        recent = rates_by.get(key) or {}
         season_min = float(season.get("MIN") or 0.0)
-        if season_min < 1.0 and not any(s in season for s in PLAYER_SIM_STATS):
-            # No rate basis — cannot simulate counting stats
+        if season_min < 1.0 and not any(s in season for s in PLAYER_SIM_STATS) and not recent:
             continue
-        # Per-minute rates from season; fall back to per-game / 30 if MIN thin
         denom = season_min if season_min >= 5.0 else max(season_min, 30.0)
         means: dict[str, float] = {}
         for stat in PLAYER_SIM_STATS:
-            base = season.get(stat)
-            if base is None or not np.isfinite(base) or base < 0:
+            season_pg = season.get(stat)
+            # Recent per-game averages from gamelog profiles
+            l5 = recent.get(f"l5_{stat}")
+            l10 = recent.get(f"l10_{stat}")
+            parts = []
+            weights = []
+            if l5 is not None and np.isfinite(float(l5)):
+                parts.append(float(l5))
+                weights.append(w5)
+            if l10 is not None and np.isfinite(float(l10)):
+                parts.append(float(l10))
+                weights.append(w10)
+            if season_pg is not None and np.isfinite(float(season_pg)) and float(season_pg) >= 0:
+                parts.append(float(season_pg))
+                weights.append(w_s)
+            if not parts:
                 continue
-            # Generative expected value this game (rate x minutes)
-            means[stat] = float(base) * (adj / denom) if season_min >= 5.0 else float(base) * (
-                adj / max(denom, 1.0)
-            )
+            wtot = sum(weights) or 1.0
+            blended_pg = sum(p * w for p, w in zip(parts, weights)) / wtot
+            # Scale per-game blend to this-game minutes
+            if season_min >= 5.0:
+                means[stat] = float(blended_pg) * (adj / denom)
+            else:
+                means[stat] = float(blended_pg) * (adj / max(denom, 1.0))
         if "PTS" not in means and not means:
             continue
-        # Ensure PTS mean exists if any counting rate does (usage share needs it)
         if "PTS" not in means:
             means["PTS"] = max(adj / 36.0 * 8.0, 1.0)
+        usage_share = None
+        try:
+            usage_share = float(r.get("usage_share")) if r.get("usage_share") is not None else None
+        except (TypeError, ValueError):
+            usage_share = None
         roster.append(
             {
                 "player": name,
                 "team": abbr,
                 "adj_minutes": round(adj, 1),
                 "means": means,
+                "usage_share": usage_share,
             }
         )
     return roster
@@ -160,6 +190,7 @@ def _simulate_chunk_pts(
     mu_pts: np.ndarray,
     scores: np.ndarray,
     rng: np.random.Generator,
+    usage_shares: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Allocate team score to players each sim via noisy usage shares.
@@ -169,7 +200,18 @@ def _simulate_chunk_pts(
     p = mu_pts.shape[0]
     if p == 0:
         return np.zeros((c, 0), dtype=np.float64)
-    base = np.maximum(mu_pts.astype(np.float64), 1e-3)
+    mu = np.maximum(mu_pts.astype(np.float64), 1e-3)
+    if usage_shares is not None and usage_shares.shape[0] == p and float(np.nansum(usage_shares)) > 0:
+        us = np.maximum(np.nan_to_num(usage_shares.astype(np.float64), nan=0.0), 0.0)
+        if float(us.sum()) > 0:
+            us = us / us.sum()
+            mu_n = mu / mu.sum()
+            # Blend possession share with scoring-rate share (avoid double-counting)
+            base = 0.55 * us + 0.45 * mu_n
+        else:
+            base = mu
+    else:
+        base = mu
     # Multiplicative log-noise around usage
     z = rng.standard_normal((c, p))
     weights = base[None, :] * np.exp(PTS_SHARE_SIGMA * z)
@@ -229,6 +271,17 @@ def simulate_team_players(
             [float((r.get("means") or {}).get(stat) or 0.0) for r in roster],
             dtype=np.float64,
         )
+    usage = np.array(
+        [
+            float(r["usage_share"])
+            if r.get("usage_share") is not None and np.isfinite(float(r.get("usage_share") or np.nan))
+            else np.nan
+            for r in roster
+        ],
+        dtype=np.float64,
+    )
+    if not np.isfinite(usage).any():
+        usage = None
 
     sum_acc = {s: np.zeros(p, dtype=np.float64) for s in PLAYER_SIM_STATS}
     max_acc = {s: np.full(p, -np.inf, dtype=np.float64) for s in PLAYER_SIM_STATS}
@@ -239,7 +292,7 @@ def simulate_team_players(
         end = min(n, start + chunk)
         sc = scores[start:end]
         # PTS: allocate team score
-        pts = _simulate_chunk_pts(mu["PTS"], sc, rng)
+        pts = _simulate_chunk_pts(mu["PTS"], sc, rng, usage_shares=usage)
         sum_acc["PTS"] += pts.sum(axis=0)
         max_acc["PTS"] = np.maximum(max_acc["PTS"], pts.max(axis=0))
         # Other counting stats: intensity-scaled Poisson
@@ -360,9 +413,14 @@ def run_matchup_player_sims(
     """Simulate both teams' player stats from the same score paths."""
     players = features.get("players")
     minutes = features.get("minutes")
+    player_rates = features.get("player_rates") or {}
     rng = np.random.default_rng(seed)
-    home_roster = build_active_roster(players, minutes, home)
-    away_roster = build_active_roster(players, minutes, away)
+    home_roster = build_active_roster(
+        players, minutes, home, player_rates=player_rates
+    )
+    away_roster = build_active_roster(
+        players, minutes, away, player_rates=player_rates
+    )
     home_sim = simulate_team_players(home_roster, home_scores, rng)
     away_sim = simulate_team_players(away_roster, away_scores, rng)
     n = int(np.asarray(home_scores).reshape(-1).shape[0])

@@ -15,6 +15,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "cache"
 OUTPUT_DIR = ROOT / "output"
+# Defined after OUTPUT_DIR; grades live under output/grades/
 
 # Reuse cached payloads newer than this (hours)
 CACHE_MAX_AGE_HOURS = float(os.getenv("CACHE_MAX_AGE_HOURS", "6"))
@@ -38,6 +39,32 @@ FORM_W_SEASON = float(os.getenv("FORM_W_SEASON", "0.20"))
 # Recent minutes / usage for projections (injury still wins)
 MINUTES_LAST_N = int(os.getenv("MINUTES_LAST_N", "8"))
 MINUTES_RECENT_WEIGHT = float(os.getenv("MINUTES_RECENT_WEIGHT", "0.65"))
+# Spill minutes from Out/Doubtful stars onto healthy teammates
+INJURY_MINUTES_REDISTRIBUTE = os.getenv("INJURY_MINUTES_REDISTRIBUTE", "1") not in {
+    "0",
+    "false",
+    "False",
+}
+INJURY_REDIST_CAP_PER_PLAYER = float(os.getenv("INJURY_REDIST_CAP_PER_PLAYER", "6.0"))
+INJURY_REDIST_TEAM_CAP = float(os.getenv("INJURY_REDIST_TEAM_CAP", "18.0"))
+# Player-sim rate blend: recent L5 / L10 / season
+PLAYER_RATE_W_L5 = float(os.getenv("PLAYER_RATE_W_L5", "0.35"))
+PLAYER_RATE_W_L10 = float(os.getenv("PLAYER_RATE_W_L10", "0.25"))
+PLAYER_RATE_W_SEASON = float(os.getenv("PLAYER_RATE_W_SEASON", "0.40"))
+# Usage share power in PTS allocation (higher = more star concentration)
+USAGE_SHARE_POWER = float(os.getenv("USAGE_SHARE_POWER", "1.15"))
+# Probabilistic injury: sample minutes factor in MC (mean still uses point estimate)
+INJURY_MC_SAMPLE = os.getenv("INJURY_MC_SAMPLE", "1") not in {"0", "false", "False"}
+# Auto-apply calibrated sigma when enough graded games
+CALIBRATION_AUTO_APPLY = os.getenv("CALIBRATION_AUTO_APPLY", "1") not in {
+    "0",
+    "false",
+    "False",
+}
+CALIBRATION_MIN_GAMES = int(os.getenv("CALIBRATION_MIN_GAMES", "20"))
+CALIBRATION_SIGMA_MIN = float(os.getenv("CALIBRATION_SIGMA_MIN", "8.0"))
+CALIBRATION_SIGMA_MAX = float(os.getenv("CALIBRATION_SIGMA_MAX", "14.0"))
+GRADES_DIR = OUTPUT_DIR / "grades"
 
 # Opponent-adjusted (SRS-style) iterations
 SRS_ITERATIONS = int(os.getenv("SRS_ITERATIONS", "10"))
