@@ -19,7 +19,7 @@ from data.process import (
     shot_profile_residual,
 )
 from data.static_arenas import normalize_abbrev
-from model.calibrate import effective_score_sigma
+from model.calibrate import effective_margin_sigma, effective_score_sigma
 from model.player_sim import run_matchup_player_sims
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def _finite(val: Any, default: float = 0.0) -> float:
 
 def margin_to_win_prob(margin: float, sigma: float | None = None) -> float:
     """P(home win) from expected margin via logistic approx to normal CDF."""
-    sig = sigma if sigma is not None else config.MARGIN_SIGMA
+    sig = sigma if sigma is not None else effective_margin_sigma()
     z = margin / max(sig, 1e-6)
     return float(1.0 / (1.0 + math.exp(-1.7 * z)))
 
@@ -179,6 +179,15 @@ def _mean_scores(
         config.HOME_COURT_POINTS if not h_ctx else 0.0,
     )
     away_pts += _finite(a_ctx.get("context_points"), 0.0)
+
+    # Offline learning: tiny per-team additive biases (capped; min-N gated at write time)
+    try:
+        from data.learning_store import team_bias_for
+
+        home_pts += team_bias_for(home)
+        away_pts += team_bias_for(away)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Multi-horizon form residual (ratings already absorbed part of form_edge)
     form = features.get("team_form") or {}
@@ -568,6 +577,12 @@ def predict_slate(
     *,
     sim_count: int | None = None,
 ) -> list[dict[str, Any]]:
+    try:
+        from data.learning_store import apply_learning_knobs
+
+        apply_learning_knobs()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Learning knobs not applied in predict_slate: %s", exc)
     games = features.get("games") or []
     preds = []
     for g in games:

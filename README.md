@@ -39,6 +39,20 @@ Outputs:
 - `output/today_predictions.md` and `output/today_predictions.json`
 - Dated copies under `output/predictions_YYYY-MM-DD.*`
 - Local cache under `cache/` (reused if newer than 6 hours)
+- Offline learning under `cache/learning/` (paste grades + capped knobs)
+
+### Offline learning (Calibration tab)
+
+Paste a `real_box` / `ai_comparison` JSON (or ASCII `DATE` / `AWAY @ HOME` / `ACT` / `PRED`) into the **Calibration** tab. Grades use projection **means/win% only** — never Highlights sim-maxes. Safe knobs (`SCORE_SIGMA`, `MARGIN_SIGMA`, home court, rest/B2B/altitude) auto-step ≤10% toward targets after ~20 graded games, with hard caps and `knob_history.jsonl` audit. `suggested_code_themes` go to `suggestions_inbox/` only (never auto code).
+
+```bash
+python main.py --import-paste path/to/paste.json
+python main.py --learning
+python main.py --apply-knobs
+python main.py --reset-knobs
+python main.py --grade
+python main.py --calibration
+```
 
 ## Environment variables
 
@@ -53,8 +67,10 @@ Outputs:
 ```
 data/fetch.py          free sources + cache
 data/process.py        EWM ratings, injuries, rest/travel
+data/learning_store.py offline paste grades + capped knobs
 data/static_arenas.py  arena lat/lon + TZ for travel
 model/predict.py       scores, margins, win probs
+model/calibrate.py     ESPN grade + calibration report
 main.py                CLI entry point
 gui.py                 desktop UI
 config.py              knobs + paths
