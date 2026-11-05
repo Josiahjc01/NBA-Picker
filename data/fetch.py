@@ -24,6 +24,7 @@ from data.cache_util import (
     write_json_cache,
 )
 from data.static_arenas import normalize_abbrev
+from safe_text import normalize_player_name
 
 logger = logging.getLogger(__name__)
 
@@ -815,7 +816,7 @@ def fetch_player_impact(force: bool = False) -> list[dict[str, Any]]:
             if rows:
                 logger.info("Player impact source %s (%d rows)", name, len(rows))
             for row in rows:
-                pname = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
+                pname = normalize_player_name(row.get("player") or "")
                 if not pname:
                     continue
                 try:
@@ -835,7 +836,7 @@ def fetch_player_impact(force: bool = False) -> list[dict[str, Any]]:
         if proxy:
             logger.info("Merging nba_api z-score proxy (%d)", len(proxy))
         for row in proxy:
-            pname = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
+            pname = normalize_player_name(row.get("player") or "")
             if not pname:
                 continue
             try:
@@ -927,15 +928,79 @@ def _athlete_gamelog_cached(
         return []
 
 
+def _impact_abs_by_name(impact: list[dict[str, Any]] | None) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for row in impact or []:
+        key = normalize_player_name(row.get("player") or "")
+        if not key:
+            continue
+        try:
+            epm = abs(float(row.get("epm") or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(epm):
+            continue
+        prev = out.get(key, 0.0)
+        if epm > prev:
+            out[key] = epm
+    return out
+
+
+def _select_slate_gamelog_names(
+    team: str,
+    team_by_name: dict[str, str],
+    id_by_name: dict[str, str],
+    season_min: dict[str, float],
+    impact_abs: dict[str, float],
+    *,
+    top_n: int = 12,
+) -> list[str]:
+    """
+    Season-MIN top-N plus high-impact roster stars so a failed season join
+    cannot starve gamelog pulls for players like Luka Doncic.
+    """
+    candidates = [
+        n for n, t in team_by_name.items() if t == team and n in id_by_name
+    ]
+    ranked = sorted(
+        candidates,
+        key=lambda n: season_min.get(n, 0.0),
+        reverse=True,
+    )
+    selected: list[str] = []
+    seen: set[str] = set()
+    for n in ranked[:top_n]:
+        selected.append(n)
+        seen.add(n)
+    epm_floor = float(config.IMPACT_GAMELOG_EPM_FLOOR)
+    impact_extras = sorted(
+        (
+            n
+            for n in candidates
+            if n not in seen and impact_abs.get(n, 0.0) >= epm_floor
+        ),
+        key=lambda n: impact_abs.get(n, 0.0),
+        reverse=True,
+    )
+    cap = int(config.GAMELOG_PER_TEAM_CAP)
+    for n in impact_extras:
+        if len(selected) >= cap:
+            break
+        selected.append(n)
+        seen.add(n)
+    return selected
+
+
 def fetch_recent_player_minutes(
     games: list[dict[str, Any]],
     rosters: list[dict[str, Any]],
     players: pd.DataFrame | None,
     force: bool = False,
+    impact: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Last-N minutes + FGA usage for slate rotation players (ESPN gamelogs).
-    Keyed by normalized player name.
+    Keyed by normalized player name (accent-folded).
     """
     slate_teams = _slate_teams(games)
     if not slate_teams:
@@ -946,7 +1011,7 @@ def fetch_recent_player_minutes(
     display_by_name: dict[str, str] = {}
     for r in rosters or []:
         raw_name = str(r.get("PLAYER_NAME") or "").strip()
-        name = re.sub(r"\s+", " ", raw_name).lower()
+        name = normalize_player_name(raw_name)
         pid = str(r.get("PLAYER_ID") or "").strip()
         abbr = normalize_abbrev(str(r.get("TEAM_ABBREVIATION") or ""))
         if name and pid and abbr in slate_teams:
@@ -964,24 +1029,18 @@ def fetch_recent_player_minutes(
                 abbr = normalize_abbrev(str(row.get(team_c) or ""))
                 if abbr not in slate_teams:
                     continue
-                key = re.sub(r"\s+", " ", str(row.get(name_c) or "").strip()).lower()
+                key = normalize_player_name(row.get(name_c) or "")
                 try:
                     season_min[key] = float(row.get(min_c))
                 except (TypeError, ValueError):
                     pass
 
+    impact_abs = _impact_abs_by_name(impact)
     out: dict[str, dict[str, Any]] = {}
     for team in slate_teams:
-        ranked = sorted(
-            (
-                (n, season_min.get(n, 0.0))
-                for n, t in team_by_name.items()
-                if t == team and n in id_by_name
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        for name, _sm in ranked[:12]:
+        for name in _select_slate_gamelog_names(
+            team, team_by_name, id_by_name, season_min, impact_abs, top_n=12
+        ):
             recent = _athlete_gamelog_cached(
                 id_by_name[name],
                 last_n=config.MINUTES_LAST_N,
@@ -1066,7 +1125,7 @@ def fetch_player_form(
     id_by_name: dict[str, str] = {}
     team_by_name: dict[str, str] = {}
     for r in rosters or []:
-        name = re.sub(r"\s+", " ", str(r.get("PLAYER_NAME") or "").strip()).lower()
+        name = normalize_player_name(r.get("PLAYER_NAME") or "")
         pid = str(r.get("PLAYER_ID") or "").strip()
         abbr = normalize_abbrev(str(r.get("TEAM_ABBREVIATION") or ""))
         if name and pid and abbr in slate_teams:
@@ -1085,7 +1144,7 @@ def fetch_player_form(
                 abbr = normalize_abbrev(str(row.get(team_c) or ""))
                 if abbr not in slate_teams:
                     continue
-                key = re.sub(r"\s+", " ", str(row.get(name_c) or "").strip()).lower()
+                key = normalize_player_name(row.get(name_c) or "")
                 if pts_c:
                     try:
                         season_pts[key] = float(row.get(pts_c))
@@ -1142,7 +1201,7 @@ def fetch_player_form(
             (
                 str(r.get("PLAYER_NAME"))
                 for r in (rosters or [])
-                if re.sub(r"\s+", " ", str(r.get("PLAYER_NAME") or "").strip()).lower() == name
+                if normalize_player_name(r.get("PLAYER_NAME") or "") == name
             ),
             name.title(),
         )
@@ -1168,6 +1227,7 @@ def fetch_player_rate_profiles(
     rosters: list[dict[str, Any]],
     players: pd.DataFrame | None,
     force: bool = False,
+    impact: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     L5 / L10 per-game counting rates for slate rotation players (ESPN gamelogs).
@@ -1180,7 +1240,7 @@ def fetch_player_rate_profiles(
     id_by_name: dict[str, str] = {}
     team_by_name: dict[str, str] = {}
     for r in rosters or []:
-        name = re.sub(r"\s+", " ", str(r.get("PLAYER_NAME") or "").strip()).lower()
+        name = normalize_player_name(r.get("PLAYER_NAME") or "")
         pid = str(r.get("PLAYER_ID") or "").strip()
         abbr = normalize_abbrev(str(r.get("TEAM_ABBREVIATION") or ""))
         if name and pid and abbr in slate_teams:
@@ -1197,25 +1257,18 @@ def fetch_player_rate_profiles(
                 abbr = normalize_abbrev(str(row.get(team_c) or ""))
                 if abbr not in slate_teams:
                     continue
-                key = re.sub(r"\s+", " ", str(row.get(name_c) or "").strip()).lower()
+                key = normalize_player_name(row.get(name_c) or "")
                 try:
                     season_min[key] = float(row.get(min_c))
                 except (TypeError, ValueError):
                     pass
 
-    stat_keys = ("pts", "reb", "ast", "stl", "blk", "fg3m", "minutes", "fga")
+    impact_abs = _impact_abs_by_name(impact)
     out: dict[str, dict[str, Any]] = {}
     for team in slate_teams:
-        ranked = sorted(
-            (
-                (n, season_min.get(n, 0.0))
-                for n, t in team_by_name.items()
-                if t == team and n in id_by_name
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        for name, _sm in ranked[:12]:
+        for name in _select_slate_gamelog_names(
+            team, team_by_name, id_by_name, season_min, impact_abs, top_n=12
+        ):
             recent = _athlete_gamelog_cached(
                 id_by_name[name],
                 last_n=max(config.FORM_L10_N, 10),
@@ -1267,18 +1320,23 @@ def fetch_all(target_date: date, force: bool = False) -> dict[str, Any]:
     # Day-of / tip-time statuses override league injury board when present
     if gameday_injuries:
         by_player = {
-            re.sub(r"\s+", " ", str(r.get("player") or "").strip()).lower(): r
+            normalize_player_name(r.get("player") or ""): r
             for r in injuries
         }
         for row in gameday_injuries:
-            key = re.sub(r"\s+", " ", str(row.get("player") or "").strip()).lower()
-            by_player[key] = row
+            key = normalize_player_name(row.get("player") or "")
+            if key:
+                by_player[key] = row
         injuries = list(by_player.values())
     impact = fetch_player_impact(force=force)
     quarter_logs = fetch_quarter_logs(force=force)
-    recent_minutes = fetch_recent_player_minutes(games, rosters, players, force=force)
+    recent_minutes = fetch_recent_player_minutes(
+        games, rosters, players, force=force, impact=impact
+    )
     player_form = fetch_player_form(games, rosters, players, force=force)
-    player_rates = fetch_player_rate_profiles(games, rosters, players, force=force)
+    player_rates = fetch_player_rate_profiles(
+        games, rosters, players, force=force, impact=impact
+    )
 
     bundle = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),

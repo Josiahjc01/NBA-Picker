@@ -39,6 +39,12 @@ FORM_W_SEASON = float(os.getenv("FORM_W_SEASON", "0.20"))
 # Recent minutes / usage for projections (injury still wins)
 MINUTES_LAST_N = int(os.getenv("MINUTES_LAST_N", "8"))
 MINUTES_RECENT_WEIGHT = float(os.getenv("MINUTES_RECENT_WEIGHT", "0.65"))
+# Healthy roster player with no season/recent minutes (join failure / thin sample)
+HEALTHY_ROSTER_MINUTES_FLOOR = float(os.getenv("HEALTHY_ROSTER_MINUTES_FLOOR", "12.0"))
+# Include slate gamelog pulls for players at/above this |EPM| even if season MIN ranks low
+IMPACT_GAMELOG_EPM_FLOOR = float(os.getenv("IMPACT_GAMELOG_EPM_FLOOR", "2.5"))
+# Max gamelog pulls per slate team (season MIN top-N plus high-impact extras)
+GAMELOG_PER_TEAM_CAP = int(os.getenv("GAMELOG_PER_TEAM_CAP", "16"))
 # Spill minutes from Out/Doubtful stars onto healthy teammates
 INJURY_MINUTES_REDISTRIBUTE = os.getenv("INJURY_MINUTES_REDISTRIBUTE", "1") not in {
     "0",

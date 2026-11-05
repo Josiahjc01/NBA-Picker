@@ -11,6 +11,7 @@ import pandas as pd
 
 import config
 from data.static_arenas import normalize_abbrev
+from safe_text import normalize_player_name
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def _col(df: pd.DataFrame, *names: str) -> str | None:
 
 
 def _norm_name(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+    return normalize_player_name(name)
 
 
 def _season_rates_by_name(players: pd.DataFrame | None) -> dict[str, dict[str, float]]:
@@ -63,7 +64,7 @@ def _season_rates_by_name(players: pd.DataFrame | None) -> dict[str, dict[str, f
         return out
     min_c = _col(df, "MIN", "minutes")
     for _, row in df.iterrows():
-        key = _norm_name(row.get(name_c))
+        key = normalize_player_name(row.get(name_c))
         if not key:
             continue
         entry: dict[str, float] = {}
@@ -131,7 +132,7 @@ def build_active_roster(
     roster: list[dict[str, Any]] = []
     for _, r in team_min.iterrows():
         name = str(r.get("player") or "")
-        key = _norm_name(name)
+        key = normalize_player_name(name)
         adj = float(r["_adj"])
         season = season_by.get(key) or {}
         recent = rates_by.get(key) or {}

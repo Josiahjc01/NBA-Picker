@@ -11,6 +11,7 @@ import pandas as pd
 
 from data.static_arenas import normalize_abbrev
 from model.player_sim import leaders_from_maxes, leaders_from_means
+from safe_text import normalize_player_name
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def _col(df: pd.DataFrame, *names: str) -> str | None:
 
 
 def _norm_name(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+    return normalize_player_name(name)
 
 
 def team_season_profiles(team_logs: pd.DataFrame | None) -> dict[str, dict[str, Any]]:
