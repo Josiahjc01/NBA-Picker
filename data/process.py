@@ -12,6 +12,7 @@ import pandas as pd
 
 import config
 from data.static_arenas import normalize_abbrev, travel_miles, timezone_shift_hours
+from safe_text import normalize_player_name
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,8 @@ def sample_injury_factor(status: str, rng: np.random.Generator) -> float:
 
 
 def _norm_name(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+    """Accent-folding name key (Dončić ≡ Doncic). Prefer normalize_player_name."""
+    return normalize_player_name(name)
 
 
 def index_injuries(injuries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -98,7 +100,7 @@ def index_injuries(injuries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         # Prefer dedicated status; only fall back to comment if status empty
         if not status.strip():
             status = str(inj.get("comment") or "")
-        key = _norm_name(name)
+        key = normalize_player_name(name)
         factor = minutes_factor_from_status(status)
         team_abbr = normalize_abbrev(str(inj.get("team_abbr") or ""))
         prev = out.get(key)
@@ -132,7 +134,7 @@ def align_players_to_rosters(
 
     roster_by_name: dict[str, dict[str, Any]] = {}
     for r in roster_rows:
-        key = _norm_name(r.get("PLAYER_NAME") or "")
+        key = normalize_player_name(r.get("PLAYER_NAME") or "")
         if not key:
             continue
         # Prefer active over inactive if duplicates
@@ -158,6 +160,7 @@ def align_players_to_rosters(
                     "ON_ROSTER": True,
                     "ROSTER_STATUS": r.get("STATUS"),
                     "SOURCE": "roster_only",
+                    "PLAYER_ID": r.get("PLAYER_ID"),
                 }
                 for r in roster_by_name.values()
             ]
@@ -173,10 +176,10 @@ def align_players_to_rosters(
     seen: set[str] = set()
     for _, row in df.iterrows():
         name = str(row.get(name_c) or "")
-        key = _norm_name(name)
+        key = normalize_player_name(name)
         rost = roster_by_name.get(key)
         if rost is None:
-            # Soft last-name+first-initial match against roster
+            # Soft last-name+first-initial match against roster (folded names)
             parts = [p for p in key.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
             if len(parts) >= 2:
                 last, first = parts[-1], parts[0]
@@ -192,10 +195,14 @@ def align_players_to_rosters(
             continue
         seen.add(key)
         d = row.to_dict()
+        # Keep season counting stats; prefer roster display name + ESPN id
         d["PLAYER_NAME"] = rost.get("PLAYER_NAME") or name
         d["TEAM_ABBREVIATION"] = normalize_abbrev(rost["TEAM_ABBREVIATION"])
         d["ON_ROSTER"] = True
         d["ROSTER_STATUS"] = rost.get("STATUS")
+        if rost.get("PLAYER_ID") is not None:
+            d["PLAYER_ID"] = rost.get("PLAYER_ID")
+        d["SOURCE"] = "season+roster"
         aligned.append(d)
 
     # Add roster players with no season-stats row yet
@@ -216,6 +223,7 @@ def align_players_to_rosters(
                 "ON_ROSTER": True,
                 "ROSTER_STATUS": rost.get("STATUS"),
                 "SOURCE": "roster_only",
+                "PLAYER_ID": rost.get("PLAYER_ID"),
             }
         )
 
@@ -1068,7 +1076,7 @@ def _match_injury(
     Exact name match first; soft last-name match only when the injury is on the
     same team (never apply another team's Coby White Out to Derrick White).
     """
-    key = _norm_name(name)
+    key = normalize_player_name(name)
     if key in injuries:
         hit = injuries[key]
         # Exact full-name hit is trusted even if team_abbr missing
@@ -1085,6 +1093,7 @@ def _match_injury(
     for ik, iv in injuries.items():
         if not _injury_team_matches(iv, team_u):
             continue
+        # Injury keys are already folded via index_injuries
         ik_parts = [p for p in ik.replace(".", "").split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
         if not ik_parts or ik_parts[-1] != last:
             continue
@@ -1105,6 +1114,8 @@ def project_player_minutes(
     """
     Projected minutes = blend(last-N minutes, season) × injury factor.
     Injury / day-of inactive always wins (factor 0 for Out).
+    Healthy roster players with no/thin season+recent minutes get a conservative
+    rotation floor so join failures never silently drop them from the active roster.
     """
     if players is None or players.empty:
         return pd.DataFrame(columns=["player", "team", "proj_minutes", "impact", "adj_minutes"])
@@ -1118,12 +1129,25 @@ def project_player_minutes(
 
     recent_minutes = recent_minutes or {}
     w_recent = float(np.clip(config.MINUTES_RECENT_WEIGHT, 0.0, 1.0))
+    floor = float(config.HEALTHY_ROSTER_MINUTES_FLOOR)
     rows = []
     for _, r in df.iterrows():
         name = str(r.get(name_c))
-        key = _norm_name(name)
+        key = normalize_player_name(name)
         team = normalize_abbrev(str(r.get(team_c, ""))) if team_c else ""
         season_mins = float(pd.to_numeric(r.get(min_c), errors="coerce") or 0.0) if min_c else 0.0
+        # Prior/career-ish minutes column if a fetch path already attached one
+        prior_mins = None
+        for pc in ("PRIOR_MIN", "prior_minutes", "CAREER_MIN", "career_minutes"):
+            if pc in df.columns and r.get(pc) is not None:
+                try:
+                    prior_mins = float(pd.to_numeric(r.get(pc), errors="coerce"))
+                except (TypeError, ValueError):
+                    prior_mins = None
+                if prior_mins is not None and (not np.isfinite(prior_mins) or prior_mins <= 0):
+                    prior_mins = None
+                if prior_mins is not None:
+                    break
         rec = recent_minutes.get(key) or {}
         recent_mins = rec.get("recent_minutes")
         try:
@@ -1131,11 +1155,25 @@ def project_player_minutes(
         except (TypeError, ValueError):
             recent_mins_f = None
         if recent_mins_f is not None and recent_mins_f > 0:
-            mins = w_recent * recent_mins_f + (1.0 - w_recent) * season_mins
-            minutes_source = "recent+season"
-        else:
+            if season_mins > 0:
+                base_season = season_mins
+                minutes_source = "recent+season"
+            elif prior_mins is not None and prior_mins > 0:
+                base_season = prior_mins
+                minutes_source = "recent+prior"
+            else:
+                base_season = 0.0
+                minutes_source = "recent"
+            mins = w_recent * recent_mins_f + (1.0 - w_recent) * base_season
+        elif season_mins > 0:
             mins = season_mins
             minutes_source = "season"
+        elif prior_mins is not None and prior_mins > 0:
+            mins = prior_mins
+            minutes_source = "prior"
+        else:
+            mins = 0.0
+            minutes_source = "none"
         # Usage nudge: high FGA/36 slightly protects minutes for stars
         usage = rec.get("usage_fga36")
         try:
@@ -1147,6 +1185,19 @@ def project_player_minutes(
 
         inj = _match_injury(name, team, injuries)
         factor = inj["minutes_factor"] if inj else 1.0
+        # Healthy roster-only / join-miss players: never silent 0 (Out still zeros via factor)
+        roster_status = str(r.get("ROSTER_STATUS") or "active").lower()
+        source = str(r.get("SOURCE") or "")
+        on_roster = bool(r.get("ON_ROSTER", True))
+        if (
+            mins < 1.0
+            and factor > 0.0
+            and on_roster
+            and roster_status not in {"inactive", "out"}
+            and source == "roster_only"
+        ):
+            mins = floor
+            minutes_source = "rotation_floor"
         rows.append(
             {
                 "player": name,
@@ -1241,8 +1292,12 @@ def redistribute_minutes_for_injuries(minute_df: pd.DataFrame) -> pd.DataFrame:
                 continue
             usage = 12.0
             try:
-                if r.get("usage_fga36") is not None:
-                    usage = float(r["usage_fga36"])
+                raw_u = r.get("usage_fga36")
+                # pandas stores missing floats as NaN; treat those as default usage
+                if raw_u is not None and not (isinstance(raw_u, float) and np.isnan(raw_u)):
+                    usage_f = float(raw_u)
+                    if np.isfinite(usage_f):
+                        usage = usage_f
             except (TypeError, ValueError):
                 usage = 12.0
             weight = max(usage, 6.0) * max(base, 1.0)
@@ -1272,7 +1327,7 @@ def team_impact_from_players(
     """Minutes-weighted sum of EPM/RAPM → team strength delta + injury notes."""
     impact_by_name: dict[str, float] = {}
     for row in impact_rows or []:
-        name = re.sub(r"\s+", " ", str(row.get("player") or "")).lower()
+        name = normalize_player_name(row.get("player") or "")
         if not name:
             continue
         try:
@@ -1292,7 +1347,7 @@ def team_impact_from_players(
         healthy = 0.0
         team_notes: list[str] = []
         for _, r in g.iterrows():
-            key = re.sub(r"\s+", " ", str(r["player"])).lower()
+            key = normalize_player_name(r["player"])
             epm = impact_by_name.get(key)
             if epm is None:
                 # last-name fallback

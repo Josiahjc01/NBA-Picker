@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import sys
+import unicodedata
 from typing import Any
 
 # Common glyphs that break Windows console / default locale file writes
@@ -17,6 +19,19 @@ _REPLACEMENTS = (
     ("\u2264", "<="),
     ("\u03c3", "sigma"),
 )
+
+
+def normalize_player_name(name: Any) -> str:
+    """
+    Fold player names for cross-source joins (ESPN / nba_api / impact).
+
+    NFKD → strip combining marks so "Dončić" / "Doncic" / "Jokić" share one key,
+    then lowercase and collapse whitespace.
+    """
+    s = "" if name is None else str(name)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", s.strip()).lower()
 
 
 def ascii_safe(text: Any, *, errors: str = "replace") -> str:
